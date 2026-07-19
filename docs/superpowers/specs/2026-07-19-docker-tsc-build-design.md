@@ -7,6 +7,7 @@ Restore the Bridge Docker image to the existing TypeScript compiler build path s
 ## Scope
 
 - Change the Bridge build step in the root `Dockerfile` from `pnpm build` to `pnpm compile`.
+- Restore the tsc build's generated `@icalingua` workspace packages to `build/node_modules` after `npm install` removes them as extraneous packages.
 - Keep `build.mjs`, the `build` package script, and the esbuild dependency unchanged.
 - Do not change Bridge runtime code, client code, image naming, or Docker Compose configuration.
 
