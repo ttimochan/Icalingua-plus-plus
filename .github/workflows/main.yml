@@ -528,8 +528,6 @@ jobs:
       - uses: geekyeggo/delete-artifact@v5
         with:
           name: arm64-unpacked
-      - uses: geekyeggo/delete-artifact@v5
-        with:
 
   pack-bridge-js:
     runs-on: ubuntu-24.04
