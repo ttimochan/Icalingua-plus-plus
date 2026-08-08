@@ -13,7 +13,7 @@
                     height="100vh"
                     :rooms-loaded="true"
                     :messages-loaded="messagesLoaded"
-                    :show-audio="false"
+                    :show-audio="true"
                     :show-reaction-emojis="false"
                     :show-new-messages-divider="false"
                     :load-first-room="true"
@@ -39,6 +39,7 @@
                     :removeHeaderEmotes="roomId < 0 && removeGroupNameEmotes"
                     :usePanguJsRecv="usePanguJsRecv"
                     :isSteamVrRunning="false"
+                    :window-drag-enabled="hideTitleBar"
                     :canLoadAfter="isInMiddle"
                     :standalone="true"
                     @send-message="sendMessage"
@@ -55,6 +56,22 @@
                 >
                     <template v-slot:menu-icon>
                         <i class="el-icon-more"></i>
+                    </template>
+                    <template v-slot:messages-top>
+                        <div v-if="dbUpgrade.active" class="db-upgrade-banner">
+                            <i class="el-icon-loading"></i>
+                            <span class="db-upgrade-banner-message">{{ dbUpgrade.message }}</span>
+                            <el-progress
+                                :percentage="
+                                    dbUpgrade.total > 0
+                                        ? Math.min(100, Math.round((dbUpgrade.step / dbUpgrade.total) * 100))
+                                        : 0
+                                "
+                                :indeterminate="dbUpgrade.total <= 0"
+                                :show-text="false"
+                                :stroke-width="4"
+                            />
+                        </div>
                     </template>
                 </Room>
             </div>
@@ -155,6 +172,7 @@ export default {
             },
             messages: [],
             messagesLoaded: false,
+            dbUpgrade: { active: false, step: 0, total: 0, message: '' },
             loading: true,
             ready: false, // 数据是否准备好
             account: 0,
@@ -163,6 +181,7 @@ export default {
             isShutUp: false,
             removeGroupNameEmotes: false,
             usePanguJsRecv: false,
+            hideTitleBar: false,
             isInMiddle: false, // 是否从中间加载（用于支持向下翻页）
             targetMessageId: null, // 定位的目标消息 ID
             pendingGotoMessageId: null, // 等待定位的消息 ID（窗口初始化时使用）
@@ -200,12 +219,14 @@ export default {
     async created() {
         // 从路由参数获取 roomId
         this.roomId = parseInt(this.$route.params.roomId)
+        this.dbUpgrade = await ipc.getDbUpgradeProgress()
 
         // 获取设置
         const settings = await ipc.getSettings()
         this.linkify = settings.linkify
         this.removeGroupNameEmotes = settings.removeGroupNameEmotes
         this.usePanguJsRecv = settings.usePanguJsRecv
+        this.hideTitleBar = settings.hideTitleBar
         this.stickerPanelBottom = settings.stickerPanelBottom
         this.stickerPanelHeight = settings.stickerPanelHeight || 320
 
@@ -264,6 +285,7 @@ export default {
         ipcRenderer.removeAllListeners('sendDice')
         ipcRenderer.removeAllListeners('sendRps')
         ipcRenderer.removeAllListeners('closePanel')
+        ipcRenderer.removeAllListeners('dbUpgradeProgress')
     },
     methods: {
         setupIpcListeners() {
@@ -271,6 +293,10 @@ export default {
             document.addEventListener('dragover', (event) => {
                 event.preventDefault()
                 event.stopPropagation()
+            })
+
+            ipcRenderer.on('dbUpgradeProgress', (_, progress) => {
+                this.dbUpgrade = progress
             })
 
             // 接收新消息
@@ -390,7 +416,9 @@ export default {
         async sendMessage(data) {
             let { content, files, replyMessage, media: extraMedia, sticker, messageType, resend } = data
 
-            const processed = await processFiles(files || [], (msg) => this.$message.warning(msg))
+            const hasImages = (files || []).some((file) => file.type.includes('image'))
+            const compressImages = hasImages ? (await ipc.getSettings()).compressImages : false
+            const processed = await processFiles(files || [], (msg) => this.$message.warning(msg), compressImages)
             const media = [...(extraMedia || []), ...processed.media]
 
             if (resend) ipc.deleteMessage(this.roomId, resend)
@@ -468,13 +496,13 @@ export default {
         },
 
         openForward(e) {
-            ipc.openForward(e.resId, e.fileName)
+            ipc.openForward(e.resId, e.fileName, e.fallbackResId)
         },
 
         async sendSticker(url) {
             const messageType = await ipc.getMessgeTypeSetting()
             const roomRef = this.$refs.room
-            const content = roomRef?.$refs?.roomTextarea?.message || ''
+            const content = roomRef?.getMessageText() || ''
             const replyMessage = roomRef?.messageReply || null
             this.sendMessage({
                 content,

@@ -41,6 +41,26 @@ export default {
                     path: 'M12,16A2,2 0 0,1 14,18A2,2 0 0,1 12,20A2,2 0 0,1 10,18A2,2 0 0,1 12,16M12,10A2,2 0 0,1 14,12A2,2 0 0,1 12,14A2,2 0 0,1 10,12A2,2 0 0,1 12,10M12,4A2,2 0 0,1 14,6A2,2 0 0,1 12,8A2,2 0 0,1 10,6A2,2 0 0,1 12,4Z',
                 },
                 {
+                    name: 'bell',
+                    path: 'M12 22c1.1 0 2-.9 2-2h-4c0 1.1.89 2 2 2zm6-6v-5c0-3.07-1.64-5.64-4.5-6.32V4c0-.83-.67-1.5-1.5-1.5s-1.5.67-1.5 1.5v.68C7.63 5.36 6 7.92 6 11v5l-2 2v1h16v-1l-2-2z',
+                },
+                {
+                    name: 'loudspeaker',
+                    path: 'M12,8H4A2,2 0 0,0 2,10V14A2,2 0 0,0 4,16H5V19A1,1 0 0,0 6,20H8A1,1 0 0,0 9,19V16H12L17,19V4L12,8M21.5,11.5C21.5,13.21 20.54,14.76 19,15.5V7.5C20.53,8.25 21.5,9.8 21.5,11.5Z',
+                },
+                {
+                    name: 'folder',
+                    path: 'M20 6h-8l-2-2H4c-1.1 0-1.99.9-1.99 2L2 18c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V8c0-1.1-.9-2-2-2zm0 12H4V8h16v10z',
+                },
+                {
+                    name: 'album',
+                    path: 'M19,3H5C3.9,3 3,3.9 3,5V19C3,20.1 3.9,21 5,21H19C20.1,21 21,20.1 21,19V5C21,3.9 20.1,3 19,3M8.5,13.5L11,16.5L14.5,12L19,18H5L8.5,13.5M16,10C15.17,10 14.5,9.33 14.5,8.5C14.5,7.67 15.17,7 16,7C16.83,7 17.5,7.67 17.5,8.5C17.5,9.33 16.83,10 16,10M1,5H2V19H1C0.45,19 0,18.55 0,18V6C0,5.45 0.45,5 1,5Z',
+                },
+                {
+                    name: 'message-star',
+                    path: 'M20,2H4C2.9,2 2,2.9 2,4V22L6,18H20C21.1,18 22,17.1 22,16V4C22,2.9 21.1,2 20,2M20,16H5.17L4,17.17V4H20V16M12,5.5L13.1,8.9L16.5,10L13.1,11.1L12,14.5L10.9,11.1L7.5,10L10.9,8.9L12,5.5Z',
+                },
+                {
                     name: 'close',
                     path: 'M12,2C17.53,2 22,6.47 22,12C22,17.53 17.53,22 12,22C6.47,22 2,17.53 2,12C2,6.47 6.47,2 12,2M15.59,7L12,10.59L8.41,7L7,8.41L10.59,12L7,15.59L8.41,17L12,13.41L15.59,17L17,15.59L13.41,12L17,8.41L15.59,7Z',
                 },
@@ -147,6 +167,22 @@ export default {
     fill: var(--chat-icon-color-menu);
 }
 
+#vac-icon-loudspeaker {
+    fill: var(--chat-icon-color-loudspeaker);
+}
+
+#vac-icon-folder {
+    fill: var(--chat-icon-color-folder);
+}
+
+#vac-icon-album {
+    fill: var(--chat-icon-color-album);
+}
+
+#vac-icon-message-star {
+    fill: var(--chat-icon-color-message-star);
+}
+
 #vac-icon-close {
     fill: var(--chat-icon-color-close);
 }
@@ -215,6 +251,10 @@ export default {
 
 #vac-icon-dropdown-scroll {
     fill: var(--chat-icon-color-dropdown-scroll);
+}
+
+#vac-icon-microphone {
+    fill: var(--chat-icon-color-microphone);
 }
 
 #vac-icon-microphone-off {

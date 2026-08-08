@@ -12,6 +12,117 @@ import { getConfig } from './configManager'
 import errorHandler from './errorHandler'
 import silkDecode from './silkDecode'
 import logger from './winstonLogger'
+import sleep from '../../utils/sleep'
+
+/** 语音异步解码完成后的落库/推送回调，由 adapter 在 storage 初始化后注册 */
+type SilkDecodeCompleter = {
+    replaceMessage: (roomId: number, messageId: string | number, message: Message) => Promise<any>
+    renewMessage: (roomId: number, messageId: string, message: Partial<Message>) => void
+    getMessage?: (roomId: number, messageId: string) => Promise<Message | null>
+}
+
+let silkDecodeCompleter: SilkDecodeCompleter | null = null
+
+export const registerSilkDecodeCompleter = (completer: SilkDecodeCompleter) => {
+    silkDecodeCompleter = completer
+}
+
+const AUDIO_DECODING_PLACEHOLDER = '[语音解码中]'
+const AUDIO_DECODING_FILE = 'decoding'
+
+const buildAudioFile = (fileName: string, fid?: string) => {
+    const file = {
+        type: 'audio/ogg',
+        url: fileName,
+        name: fileName,
+    } as Message['file']
+    if (fid) file.fid = fid
+    return file
+}
+
+const clearDecodingPlaceholderContent = (content: string) => {
+    if (!content) return ''
+    if (content === AUDIO_DECODING_PLACEHOLDER) return ''
+    return content.split(AUDIO_DECODING_PLACEHOLDER).join('').replace(/^\n+/, '').replace(/\n+$/, '')
+}
+
+const shiftMediaOrders = (message: Message, removedLength: number) => {
+    for (const file of message.files || []) {
+        if (Number.isInteger(file.order)) file.order = Math.max(0, file.order - removedLength)
+    }
+}
+
+/**
+ * 后台解码 silk，不阻塞消息入库。
+ * 等消息写入 DB 后再 replace + renew，避免与 addMessage 竞态。
+ */
+const scheduleAsyncSilkDecode = (roomId: number, message: Message, url: string, fileIndex: number, fid?: string) => {
+    const messageId = message._id
+    if (messageId === undefined || messageId === null || messageId === '') return
+
+    setImmediate(async () => {
+        const completer = silkDecodeCompleter
+        if (!completer) {
+            // 未注册 completer 时退回同步语义：至少尝试解码并改内存对象
+            try {
+                const fileName = await silkDecode(url)
+                const file = buildAudioFile(fileName, fid)
+                message.file = file
+                message.files[fileIndex] = file
+                message.content = clearDecodingPlaceholderContent(message.content)
+            } catch (e) {
+                errorHandler(e, true)
+                message.content = '[语音转换失败]' + (e as Error).message + '\n' + url
+            }
+            return
+        }
+
+        try {
+            const fileName = await silkDecode(url)
+            const file = buildAudioFile(fileName, fid)
+
+            // 等待消息落库，避免 replace 早于 insert
+            if (completer.getMessage) {
+                const deadline = Date.now() + 3000
+                while (Date.now() < deadline) {
+                    const existing = await completer.getMessage(roomId, String(messageId))
+                    if (existing) break
+                    await sleep(20)
+                }
+            } else {
+                await sleep(50)
+            }
+
+            message.file = file
+            if (fileIndex >= 0 && fileIndex < message.files.length) {
+                message.files[fileIndex] = file
+            } else {
+                message.files.push(file)
+            }
+            message.content = clearDecodingPlaceholderContent(message.content)
+
+            await completer.replaceMessage(roomId, messageId, message)
+            completer.renewMessage(roomId, String(messageId), {
+                file,
+                files: message.files,
+                content: message.content,
+            })
+        } catch (e) {
+            errorHandler(e, true)
+            message.content = '[语音转换失败]' + (e as Error).message + '\n' + url
+            try {
+                await completer.replaceMessage(roomId, messageId, message)
+                completer.renewMessage(roomId, String(messageId), {
+                    content: message.content,
+                    file: message.file,
+                    files: message.files,
+                })
+            } catch (err) {
+                errorHandler(err, true)
+            }
+        }
+    })
+}
 
 const processMessage = async (
     oicqMessage: MessageElem[],
@@ -37,6 +148,7 @@ const processMessage = async (
                     lastReply = true
                     break
                 }
+                if (!m.data.text || m.data.text === '@') m.data.text = `@${String(m.data.qq)}`
             // noinspection FallThroughInSwitchStatementJS 确信
             case 'text':
                 // PCQQ 发送的消息的换行符是 \r，统一转成 \n
@@ -82,6 +194,7 @@ const processMessage = async (
                 message.file = {
                     type: 'image/jpeg',
                     url,
+                    order: message.content.length,
                 }
                 message.files.push(message.file)
                 break
@@ -94,6 +207,7 @@ const processMessage = async (
                 message.file = {
                     type: 'image/webp',
                     url,
+                    order: message.content.length,
                 }
                 message.files.push(message.file)
                 break
@@ -132,7 +246,20 @@ const processMessage = async (
                 }
                 if (!replyMessage) {
                     //get the message
-                    const getRet = await oicq.getMsg(m.data.id)
+                    let getRet
+                    if (m.data.message) {
+                        getRet = {
+                            data: {
+                                sender: {
+                                    nickname: String(user_id),
+                                    user_id,
+                                },
+                                message: m.data.message,
+                            },
+                        }
+                    } else {
+                        getRet = await oicq.getMsg(m.data.id)
+                    }
                     if (getRet.data) {
                         //获取到库里面还没有的历史消息
                         //暂时先不加回库里了
@@ -162,6 +289,7 @@ const processMessage = async (
                         _id: m.data.id,
                         username: replyMessage.username,
                         content: replyMessage.content,
+                        markdown: replyMessage.markdown,
                         files: [],
                     }
                     if (replyMessage.file) {
@@ -374,24 +502,36 @@ const processMessage = async (
                 }
                 message.files.push(message.file)
                 break
-            case 'record':
-                try {
-                    const fileName = await silkDecode(m.data.url)
-                    message.file = {
-                        type: 'audio/ogg',
-                        url: fileName,
-                        name: fileName,
-                    }
-                    if (typeof m.data.file === 'string') {
-                        message.file.fid = m.data.file
-                    }
-                    message.files.push(message.file)
-                } catch (e) {
-                    errorHandler(e, true)
-                    message.content = '[语音转换失败]' + e.message + '\n' + m.data.url
-                }
+            case 'record': {
                 lastMessage.content = '[Audio]'
+                const recordUrl = m.data.url
+                const recordFid = typeof m.data.file === 'string' ? m.data.file : undefined
+                if (!recordUrl) {
+                    message.content += '[语音下载失败]undefined'
+                    break
+                }
+
+                // 主消息（有 _id + roomId）异步解码，避免阻塞收消息热路径
+                // 回复引用等嵌套消息没有稳定 _id，仍同步解码
+                const canAsyncDecode =
+                    roomId != null && message._id !== undefined && message._id !== null && message._id !== ''
+
+                if (canAsyncDecode) {
+                    message.file = buildAudioFile(AUDIO_DECODING_FILE, recordFid)
+                    message.files.push(message.file)
+                    scheduleAsyncSilkDecode(roomId, message, recordUrl, message.files.length - 1, recordFid)
+                } else {
+                    try {
+                        const fileName = await silkDecode(recordUrl)
+                        message.file = buildAudioFile(fileName, recordFid)
+                        message.files.push(message.file)
+                    } catch (e) {
+                        errorHandler(e, true)
+                        message.content = '[语音转换失败]' + (e as Error).message + '\n' + recordUrl
+                    }
+                }
                 break
+            }
             case 'mirai':
                 try {
                     message.mirai = JSON.parse(m.data.data)
@@ -405,11 +545,13 @@ const processMessage = async (
                         if (index > -1) {
                             sender = message.content.substring(0, index)
                             message.content = message.content.substring(index + 3)
+                            shiftMediaOrders(message, index + 3)
                         } else {
                             //是图片之类没有真实文本内容的
                             //去除尾部：
                             sender = message.content.substring(0, message.content.length - 2)
                             message.content = ''
+                            shiftMediaOrders(message, Number.MAX_SAFE_INTEGER)
                         }
                         message.username = lastMessage.username = sender
                         lastMessage.content = lastMessage.content.substring(sender.length + 3)
@@ -419,11 +561,13 @@ const processMessage = async (
                         if (index > -1) {
                             sender = message.content.substr(0, index)
                             message.content = message.content.substr(index + 2)
+                            shiftMediaOrders(message, index + 2)
                         } else {
                             //是图片之类没有真实文本内容的
                             //去除尾部：
                             sender = message.content.substr(0, message.content.length - 1)
                             message.content = ''
+                            shiftMediaOrders(message, Number.MAX_SAFE_INTEGER)
                         }
                         message.username = lastMessage.username = sender
                         lastMessage.content = lastMessage.content.substr(sender.length + 1)
@@ -498,7 +642,8 @@ const processMessage = async (
                 }
             }
         } catch (e) {}
-        message.content += '\n\n[markdown]\n' + markdown
+        message.markdown = true
+        message.content = markdown
     }
     return { message, lastMessage }
 }

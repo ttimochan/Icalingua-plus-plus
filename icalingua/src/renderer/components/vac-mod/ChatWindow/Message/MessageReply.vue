@@ -1,7 +1,8 @@
 <template>
     <div class="vac-reply-message">
-        <div class="vac-reply-username" v-if="message.replyMessage.username">
-            {{ message.replyMessage.username }}
+        <div class="vac-reply-username">
+            <span v-if="message.replyMessage.username">{{ message.replyMessage.username }}</span>
+            <span v-else>{{ replySenderId }}</span>
             <div style="float: right; width: 15px; height: 15px; cursor: pointer" @click="scrollToOrigin">
                 <svg
                     width="15"
@@ -23,39 +24,78 @@
             </div>
         </div>
 
-        <div v-if="isImage && !hideChatImageByDefault" class="vac-image-reply-container" @click="openImage">
-            <el-image
-                :src="message.replyMessage.file.url"
-                fit="cover"
-                referrer-policy="no-referrer"
-                class="vac-message-image-reply"
-                @error="onReplyImageError"
-            >
-                <div slot="error" class="image-slot">
-                    <i class="el-icon-picture-outline"></i>
+        <template v-if="orderedReplyParts">
+            <div v-for="part in orderedReplyParts" :key="part.key" class="vac-reply-content">
+                <div
+                    v-if="part.type === 'image' && !hideChatImageByDefault"
+                    class="vac-image-reply-container"
+                    @click="openImage(part.file, $event)"
+                >
+                    <el-image
+                        :src="part.file.url"
+                        fit="cover"
+                        referrer-policy="no-referrer"
+                        class="vac-message-image-reply"
+                        @error="onReplyImageError(part.file)"
+                    >
+                        <div slot="error" class="image-slot">
+                            <i class="el-icon-picture-outline"></i>
+                        </div>
+                    </el-image>
                 </div>
-            </el-image>
-        </div>
+                <format-message
+                    v-else-if="part.type === 'text'"
+                    :content="part.content"
+                    :text-formatting="true"
+                    :linkify="linkify"
+                    :showForwardPanel="showForwardPanel"
+                    :forward-res-id="forwardResId"
+                    :code="message.replyMessage.code"
+                    :usePanguJs="usePanguJs"
+                    @open-forward="$emit('open-forward', $event)"
+                />
+            </div>
+        </template>
+        <template v-else>
+            <div
+                v-if="isImage && !hideChatImageByDefault"
+                class="vac-image-reply-container"
+                @click="openImage(message.replyMessage.file, $event)"
+            >
+                <el-image
+                    :src="message.replyMessage.file.url"
+                    fit="cover"
+                    referrer-policy="no-referrer"
+                    class="vac-message-image-reply"
+                    @error="onReplyImageError(message.replyMessage.file)"
+                >
+                    <div slot="error" class="image-slot">
+                        <i class="el-icon-picture-outline"></i>
+                    </div>
+                </el-image>
+            </div>
 
-        <div class="vac-reply-content">
-            <format-message
-                :content="message.replyMessage.content"
-                :users="roomUsers"
-                :text-formatting="true"
-                :reply="true"
-                :linkify="linkify"
-                :showForwardPanel="showForwardPanel"
-                :forward-res-id="forwardResId"
-                :usePanguJs="usePanguJs"
-                @open-forward="$emit('open-forward', $event)"
-            />
-        </div>
+            <div class="vac-reply-content">
+                <format-message
+                    :content="message.replyMessage.content"
+                    :text-formatting="true"
+                    :linkify="linkify"
+                    :showForwardPanel="showForwardPanel"
+                    :forward-res-id="forwardResId"
+                    :code="message.replyMessage.code"
+                    :usePanguJs="usePanguJs"
+                    @open-forward="$emit('open-forward', $event)"
+                />
+            </div>
+        </template>
     </div>
 </template>
 
 <script>
 import FormatMessage from '../../components/FormatMessage'
 import { ipcRenderer } from 'electron'
+import { getOrderedMessageParts } from '../../utils/messageMediaOrder'
+import { parseReplySenderId } from '../../utils/parseReplySenderId'
 
 const { isImageFile } = require('../../utils/mediaFile')
 
@@ -66,7 +106,6 @@ export default {
     props: {
         linkify: { type: Boolean, default: true },
         message: { type: Object, required: true },
-        roomUsers: { type: Array, required: true },
         showForwardPanel: { type: Boolean, required: true },
         forwardResId: { type: String, required: false },
         hideChatImageByDefault: { type: Boolean, required: true },
@@ -84,6 +123,12 @@ export default {
         isImage() {
             return isImageFile(this.message.replyMessage.file)
         },
+        orderedReplyParts() {
+            return getOrderedMessageParts(this.message.replyMessage)
+        },
+        replySenderId() {
+            return parseReplySenderId(this.message.replyMessage)
+        },
     },
 
     methods: {
@@ -91,8 +136,7 @@ export default {
             if (this.showForwardPanel) return
             this.$emit('scroll-to-message', this.message.replyMessage._id)
         },
-        async onReplyImageError() {
-            const file = this.message.replyMessage.file
+        async onReplyImageError(file) {
             if (
                 !this.retried &&
                 file &&
@@ -119,9 +163,9 @@ export default {
                 }
             }
         },
-        openImage(e) {
+        openImage(file, e) {
             if (this.showForwardPanel) return
-            ipcRenderer.send('openImage', this.message.replyMessage.file.url, this.localImageViewerByDefault)
+            ipcRenderer.send('openImage', file.url, this.localImageViewerByDefault)
             e.stopPropagation()
         },
     },

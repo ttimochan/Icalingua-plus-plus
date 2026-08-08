@@ -5,7 +5,7 @@ import StorageProvider from '@icalingua/types/StorageProvider'
 import MongoStorageProvider from '@icalingua/storage-providers/MongoStorageProvider'
 import RedisStorageProvider from '@icalingua/storage-providers/RedisStorageProvider'
 import SQLStorageProvider from '@icalingua/storage-providers/SQLStorageProvider'
-import { broadcast } from '../providers/socketIoProvider'
+import { broadcast, broadcastDatabaseUpgradeProgress } from '../providers/socketIoProvider'
 import OnebotClient, { GroupMessage } from '../clients/OnebotClient'
 import Room from '@icalingua/types/Room'
 import ChatGroup from '@icalingua/types/ChatGroup'
@@ -29,7 +29,12 @@ import {
     Ret,
 } from 'oicq-icalingua-plus-plus'
 import Message from '@icalingua/types/Message'
-import createProcessMessage from '../utils/processMessage'
+import createProcessMessage, { registerSilkDecodeCompleter } from '../utils/processMessage'
+import {
+    getMediaPartIndex,
+    shiftMediaOrdersAfterTextReplacement,
+    splitContentByMediaOrder,
+} from '../utils/messageMediaOrder'
 import formatDate from '../utils/formatDate'
 import { Socket } from 'socket.io'
 import SendMessageParams from '@icalingua/types/SendMessageParams'
@@ -96,7 +101,13 @@ const initStorage = async () => {
             default:
                 break
         }
+        storage.onUpgradeProgress = (progress) => broadcastDatabaseUpgradeProgress(progress)
         await storage.connect()
+        registerSilkDecodeCompleter({
+            replaceMessage: (roomId, messageId, message) => storage.replaceMessage(roomId, messageId, message),
+            renewMessage: (roomId, messageId, message) => clients.renewMessage(roomId, messageId, message),
+            getMessage: (roomId, messageId) => storage.getMessage(roomId, messageId),
+        })
         storage.getAllRooms().then((e) => {
             e.forEach(async (e) => {
                 //更新群的名称
@@ -672,6 +683,8 @@ const replaceRkey = (url: string) => {
 }
 
 const adapter: typeof oicqAdapter = {
+    isMessageSearchIndexReady: () => storage?.isMessageSearchIndexReady?.() === true,
+    validateMessageSearchIndex: () => storage?.validateMessageSearchIndex?.() || Promise.resolve(),
     loggedIn: false,
     async createBot(form: LoginForm) {
         bot = new OnebotClient(config.onebot)
@@ -907,6 +920,35 @@ const adapter: typeof oicqAdapter = {
         }
 
         const chain: MessageElem[] = []
+        const consumedMedia = new Set<number>()
+        const appendMedia = (index: number) => {
+            const img = media?.[index]
+            if (!img || consumedMedia.has(index)) return
+            const rawB64 = img.b64 ? img.b64.replace(/^data:.+;base64,/, '') : null
+            if (img.b64) {
+                chain.push({
+                    type: 'image',
+                    data: {
+                        file: 'base64://' + rawB64,
+                        type: sticker ? 'face' : 'image',
+                        // @ts-ignore
+                        sub_type: sticker ? 1 : 0,
+                    },
+                })
+            } else if (img.url) {
+                chain.push({
+                    type: 'image',
+                    data: {
+                        file: img.url,
+                        type: sticker ? 'face' : 'image',
+                        // @ts-ignore
+                        sub_type: sticker ? 1 : 0,
+                        url: img.url.replace(/\\/g, '/'),
+                    },
+                })
+            }
+            consumedMedia.add(index)
+        }
 
         if (messageType === 'anonymous') {
             if (roomId < 0)
@@ -941,6 +983,7 @@ const adapter: typeof oicqAdapter = {
                         id: atQQ === 1 ? 'all' : atQQ,
                         text: name,
                     })
+                    shiftMediaOrdersAfterTextReplacement(media, icalinguaAt.index, icalinguaAt[0].length, name.length)
                     content = content.replace(icalinguaAt[0], name)
                 } catch (e) {
                     console.error(e)
@@ -949,7 +992,7 @@ const adapter: typeof oicqAdapter = {
             }
             //这里是处理@人和表情 markup 的逻辑
             const FACE_REGEX = /\[Face: (\d+)]/
-            let splitContent = [content]
+            let splitContent = messageType === 'text' ? splitContentByMediaOrder(content, media || []) : [content]
             // 把 @xxx 的部分单独分割开
             // '喵@小A @小B呜' -> ['喵', '@小A', ' ', '@小B', '呜']
             for (const { text } of at) {
@@ -989,6 +1032,11 @@ const adapter: typeof oicqAdapter = {
             splitContent = newParts
             // 最后根据每个 string 元素判断类型并且换成对应的 MessageElem
             for (const part of splitContent) {
+                const mediaIndex = getMediaPartIndex(part)
+                if (mediaIndex !== null) {
+                    appendMedia(mediaIndex)
+                    continue
+                }
                 const atInfo = at.find((e) => e.text === part)
                 const isFace = FACE_REGEX.test(part)
                 let element: MessageElem
@@ -1068,31 +1116,7 @@ const adapter: typeof oicqAdapter = {
             }
         }
         if (media && media.length) {
-            for (const img of media) {
-                const rawB64 = img.b64 ? img.b64.replace(/^data:.+;base64,/, '') : null
-                if (img.b64) {
-                    chain.push({
-                        type: 'image',
-                        data: {
-                            file: 'base64://' + rawB64,
-                            type: sticker ? 'face' : 'image',
-                            // @ts-ignore
-                            sub_type: sticker ? 1 : 0,
-                        },
-                    })
-                } else if (img.url) {
-                    chain.push({
-                        type: 'image',
-                        data: {
-                            file: img.url,
-                            type: sticker ? 'face' : 'image',
-                            // @ts-ignore
-                            sub_type: sticker ? 1 : 0,
-                            url: img.url.replace(/\\/g, '/'),
-                        },
-                    })
-                }
-            }
+            media.forEach((_, index) => appendMedia(index))
         } else if (file) {
             chain.push({
                 type: 'image',
@@ -1273,7 +1297,8 @@ const adapter: typeof oicqAdapter = {
         }
     },
     setGroupBan(gin: number, uin: number, duration?: number): any {
-        bot.setGroupBan(gin, uin, duration)
+        if (uin === 0) bot.setGroupWholeBan(gin, duration > 0)
+        else bot.setGroupBan(gin, uin, duration)
     },
     setGroupAnonymousBan(gin: number, flag: string, duration?: number): any {
         bot.setGroupAnonymousBan(gin, flag, duration)

@@ -71,7 +71,12 @@ export default interface Adapter {
 
     fetchMessagesBySender(roomId: number, senderId: number, offset: number): Promise<Message[]>
 
+    /** Use roomId 0 to search all conversations. */
     searchMessages(roomId: number, keyword: string, offset: number): Promise<Message[]>
+
+    isMessageSearchIndexReady?(): boolean
+
+    validateMessageSearchIndex?(): Promise<void>
 
     sliderLogin(ticket: string): void
 
@@ -116,6 +121,8 @@ export default interface Adapter {
     logOut(): void
 
     clearCurrentRoomUnread(): any
+
+    markRoomUnread(roomId: number): any
 
     setRoomPriority(roomId: number, priority: 1 | 2 | 3 | 4 | 5): any
 

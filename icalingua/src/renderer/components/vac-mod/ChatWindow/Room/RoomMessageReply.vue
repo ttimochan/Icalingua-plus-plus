@@ -5,17 +5,17 @@
                 <img v-if="isImageFile" :src="messageReply.file.url" class="vac-image-reply" />
                 <div class="vac-reply-info">
                     <div class="vac-reply-username">
-                        {{ messageReply.username }}
+                        {{ messageReply.username || replySenderId }}
                     </div>
                     <div class="vac-reply-content">
                         <format-message
                             :content="messageReply.content"
-                            :users="room.users"
                             :text-formatting="true"
-                            :reply="true"
                             :linkify="linkify"
                             :showForwardPanel="showForwardPanel"
+                            :code="messageReply.code"
                             :usePanguJs="usePanguJs"
+                            @open-forward="$emit('open-forward', $event)"
                         />
                     </div>
                 </div>
@@ -35,6 +35,7 @@
 <script>
 import SvgIcon from '../../components/SvgIcon'
 import FormatMessage from '../../components/FormatMessage'
+import { parseReplySenderId } from '../../utils/parseReplySenderId'
 
 const { isImageFile } = require('../../utils/mediaFile')
 
@@ -56,6 +57,9 @@ export default {
     computed: {
         isImageFile() {
             return isImageFile(this.messageReply.file)
+        },
+        replySenderId() {
+            return parseReplySenderId(this.messageReply)
         },
     },
 }
@@ -94,6 +98,10 @@ export default {
         font-size: 12px;
         color: var(--chat-message-color-reply-content);
         white-space: pre-line;
+        display: -webkit-box;
+        -webkit-line-clamp: 5;
+        -webkit-box-orient: vertical;
+        overflow: hidden;
     }
 
     .vac-icon-reply {

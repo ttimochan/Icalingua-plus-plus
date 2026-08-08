@@ -2,9 +2,16 @@ import Room from './Room'
 import Message from './Message'
 import IgnoreChatInfo from './IgnoreChatInfo'
 import ChatGroup from './ChatGroup'
+import DatabaseUpgradeProgress from './DatabaseUpgradeProgress'
 
 export default interface StorageProvider {
     connect(): Promise<void>
+
+    onUpgradeProgress?: (progress: DatabaseUpgradeProgress) => void
+
+    isMessageSearchIndexReady?(): boolean
+
+    validateMessageSearchIndex?(): Promise<void>
 
     updateRoom(roomId: number, room: Partial<Room>): Promise<any>
 
@@ -54,6 +61,7 @@ export default interface StorageProvider {
 
     fetchMessagesBySender(roomId: number, senderId: string, skip: number, limit: number): Promise<Message[]>
 
+    /** Use roomId 0 to search all conversations; global results include their original roomId. */
     searchMessages(roomId: number, keyword: string, skip: number, limit: number): Promise<Message[]>
 
     /** 关闭数据库连接，释放资源。应在进程退出前调用。 */

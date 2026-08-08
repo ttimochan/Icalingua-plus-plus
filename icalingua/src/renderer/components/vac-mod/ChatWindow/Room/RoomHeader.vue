@@ -1,5 +1,5 @@
 <template>
-    <div class="vac-room-header vac-app-border-b">
+    <div class="vac-room-header vac-app-border-b" :class="{ 'vac-window-drag-region': windowDragEnabled }">
         <slot name="room-header" v-bind="{ room, typingUsers }">
             <div class="vac-room-wrapper">
                 <div v-show="showSinglePanel" class="vac-svg-button vac-room-back" @click="$emit('back-contact')">
@@ -45,10 +45,50 @@
                     </slot>
                 </div>
                 <slot v-if="room.roomId" name="room-options">
-                    <div class="vac-svg-button vac-room-options" @click="$emit('room-menu', $event)">
-                        <slot name="menu-icon">
-                            <svg-icon name="menu" />
-                        </slot>
+                    <div class="vac-room-actions-group">
+                        <div v-if="room.roomId < 0" class="vac-room-actions">
+                            <button
+                                type="button"
+                                class="vac-svg-button vac-room-action"
+                                title="群公告"
+                                aria-label="打开群公告"
+                                @click="$emit('open-group-announcements')"
+                            >
+                                <svg-icon name="loudspeaker" />
+                            </button>
+                            <button
+                                type="button"
+                                class="vac-svg-button vac-room-action"
+                                title="群文件"
+                                aria-label="打开群文件"
+                                @click="$emit('open-group-files')"
+                            >
+                                <svg-icon name="folder" />
+                            </button>
+                            <button
+                                type="button"
+                                class="vac-svg-button vac-room-action"
+                                title="群相册"
+                                aria-label="打开群相册"
+                                @click="$emit('open-group-album')"
+                            >
+                                <svg-icon name="album" />
+                            </button>
+                            <button
+                                type="button"
+                                class="vac-svg-button vac-room-action"
+                                title="群精华"
+                                aria-label="打开群精华"
+                                @click="$emit('open-group-essence')"
+                            >
+                                <svg-icon name="message-star" />
+                            </button>
+                        </div>
+                        <div class="vac-svg-button vac-room-options" @click="$emit('room-menu', $event)" title="菜单">
+                            <slot name="menu-icon">
+                                <svg-icon name="menu" />
+                            </slot>
+                        </div>
                     </div>
                     <transition v-if="menuActions.length" name="vac-slide-left">
                         <div v-if="menuOpened" v-click-outside="closeMenu" class="vac-menu-options">
@@ -68,6 +108,7 @@
 </template>
 
 <script>
+// allow: SIZE_OK - 房间头部的模板、交互与主题样式必须由同一个 Vue SFC 共同封装
 import vClickOutside from 'v-click-outside'
 
 import SvgIcon from '../../components/SvgIcon'
@@ -98,6 +139,7 @@ export default {
         membersCount: { type: Number, default: 0 },
         showSinglePanel: { type: Boolean, require: false, default: false },
         removeEmotes: { type: Boolean, require: false, default: false },
+        windowDragEnabled: { type: Boolean, default: false },
     },
 
     data() {
@@ -140,6 +182,22 @@ export default {
     z-index: 10;
     background: var(--chat-header-bg-color);
     border-top-right-radius: var(--chat-container-border-radius);
+}
+
+.vac-window-drag-region {
+    -webkit-app-region: drag;
+    user-select: none;
+}
+
+.vac-window-drag-region .vac-room-back,
+.vac-window-drag-region .vac-toggle-button,
+.vac-window-drag-region .vac-info-wrapper.vac-item-clickable,
+.vac-window-drag-region .vac-room-info,
+.vac-window-drag-region .vac-room-actions-group,
+.vac-window-drag-region .vac-menu-options,
+.vac-window-drag-region a,
+.vac-window-drag-region button {
+    -webkit-app-region: no-drag;
 }
 
 .vac-room-wrapper {
@@ -186,7 +244,77 @@ export default {
 }
 
 .vac-room-options {
+    display: flex;
+    width: 32px;
+    height: 32px;
+    align-items: center;
+    justify-content: center;
+    max-height: none;
+}
+
+.vac-room-options svg {
+    display: block;
+    height: 20px;
+    width: 20px;
+}
+
+.vac-room-actions {
+    display: flex;
+    flex: 0 0 auto;
+    align-items: center;
+    gap: 8px;
+}
+
+.vac-room-actions-group {
+    display: flex;
+    align-items: center;
+    gap: 8px;
     margin-left: auto;
+}
+
+.vac-room-action {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 32px;
+    height: 32px;
+    padding: 0;
+    border: 0;
+    outline: none;
+    color: var(--chat-icon-color-menu);
+    background: transparent;
+    transition:
+        transform 0.2s,
+        opacity 0.2s;
+}
+
+.vac-room-action svg {
+    height: 20px;
+    width: 20px;
+}
+
+.vac-room-action svg path {
+    fill: currentColor;
+}
+
+.vac-room-action:active {
+    transform: scale(0.93);
+}
+
+.vac-room-action:focus-visible {
+    outline: 2px solid var(--chat-icon-color-file);
+    outline-offset: 2px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+    .vac-room-action {
+        transition: none;
+    }
+
+    .vac-room-action:hover,
+    .vac-room-action:active {
+        transform: none;
+    }
 }
 
 .vac-room-back {

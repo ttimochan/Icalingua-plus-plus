@@ -26,13 +26,24 @@
                         <SideBarIcon
                             icon="el-icon-chat-square"
                             name="All Chats"
+                            title="查看所有会话"
                             :selected="selectedChatGroup === 'chats'"
                             :redPoint="chatGroupsUnreadCount['chats']"
                             @click="selectChatGroup('chats')"
                         />
                         <SideBarIcon
+                            name="Group"
+                            title="查看所有群聊"
+                            :selected="selectedChatGroup === 'group'"
+                            :redPoint="chatGroupsUnreadCount['group']"
+                            @click="selectChatGroup('group')"
+                        >
+                            <GroupChatIcon slot="icon" />
+                        </SideBarIcon>
+                        <SideBarIcon
                             icon="el-icon-user"
                             name="Private"
+                            title="查看所有私聊"
                             :selected="selectedChatGroup === 'private'"
                             :redPoint="chatGroupsUnreadCount['private']"
                             @click="selectChatGroup('private')"
@@ -45,11 +56,16 @@
                             :selected="selectedChatGroup === chatGroup.name"
                             :redPoint="chatGroupsUnreadCount[chatGroup.name]"
                             @click="selectChatGroup(chatGroup.name)"
+                            :title="`查看分组：${chatGroup.name}`"
                             @click-middle="removeChatGroup(chatGroup.name)"
                             @click-right="updateChatGroup(chatGroup.name)"
                         />
-                        <SideBarIcon icon="el-icon-edit-outline" name="Edit" @click="chatGroupEditorVisible = true" />
-                        <SideBarIcon icon="el-icon-plus" name="Add" @click="editChatGroups" />
+                        <SideBarIcon
+                            icon="el-icon-edit-outline"
+                            name="Edit"
+                            title="编辑分组"
+                            @click="chatGroupEditorVisible = true"
+                        />
                         <SideBarIcon
                             icon="el-icon-s-unfold"
                             name="Next"
@@ -65,10 +81,10 @@
                         @mousedown.prevent="onGroupTrackMouseDown"
                     >
                         <div
+                            ref="chatGroupScrollbarThumb"
                             class="custom-scrollbar-group-thumb"
                             :style="{
                                 height: groupThumbHeight + 'px',
-                                transform: `translateY(${groupThumbTop}px)`,
                             }"
                             @mousedown.prevent.stop="onGroupThumbMouseDown"
                         />
@@ -116,7 +132,7 @@
                         height="100vh"
                         :rooms-loaded="true"
                         :messages-loaded="messagesLoaded"
-                        :show-audio="false"
+                        :show-audio="true"
                         :show-reaction-emojis="false"
                         :show-new-messages-divider="false"
                         :load-first-room="false"
@@ -142,6 +158,7 @@
                         :removeHeaderEmotes="selectedRoom.roomId < 0 && removeGroupNameEmotes"
                         :usePanguJsRecv="usePanguJsRecv"
                         :isSteamVrRunning="isSteamVrRunning"
+                        :window-drag-enabled="hideTitleBar"
                         :canLoadAfter="isInMiddle"
                         @clear-last-unread-count="clearLastUnreadCount"
                         @clear-last-unread-at="clearLastUnreadAt"
@@ -165,6 +182,22 @@
                     >
                         <template v-slot:menu-icon>
                             <i class="el-icon-more"></i>
+                        </template>
+                        <template v-slot:messages-top>
+                            <div v-if="dbUpgrade.active" class="db-upgrade-banner">
+                                <i class="el-icon-loading"></i>
+                                <span class="db-upgrade-banner-message">{{ dbUpgrade.message }}</span>
+                                <el-progress
+                                    :percentage="
+                                        dbUpgrade.total > 0
+                                            ? Math.min(100, Math.round((dbUpgrade.step / dbUpgrade.total) * 100))
+                                            : 0
+                                    "
+                                    :indeterminate="dbUpgrade.total <= 0"
+                                    :show-text="false"
+                                    :stroke-width="4"
+                                />
+                            </div>
                         </template>
                     </Room>
                     <pre
@@ -291,7 +324,7 @@
                 <el-button @click="sendDice(5)">5</el-button>
                 <el-button @click="sendDice(6)">6</el-button>
             </div>
-            <span slot="footer">
+            <span slot="footer" class="random-dialog-footer">
                 <el-checkbox v-model="sendDiceNew">新版</el-checkbox>
                 <el-button @click="sendDiceShown = false">取消</el-button>
                 <el-button type="primary" @click="sendDice(0)">随机</el-button>
@@ -303,7 +336,7 @@
                 <el-button @click="sendRps(2)">剪刀</el-button>
                 <el-button @click="sendRps(3)">布</el-button>
             </div>
-            <span slot="footer">
+            <span slot="footer" class="random-dialog-footer">
                 <el-checkbox v-model="sendRpsNew">新版</el-checkbox>
                 <el-button @click="sendRpsShown = false">取消</el-button>
                 <el-button type="primary" @click="sendRps(0)">随机</el-button>
@@ -333,11 +366,13 @@ import { Multipane, MultipaneResizer } from '../components/multipane'
 import path from 'path'
 import { ipcRenderer } from 'electron'
 import SideBarIcon from '../components/SideBarIcon.vue'
+import GroupChatIcon from '../components/GroupChatIcon.vue'
 import TheRoomsPanel from '../components/TheRoomsPanel.vue'
 import TheContactsPanel from '../components/TheContactsPanel.vue'
 import TheGroupMemberPanel from '../components/TheGroupMemberPanel.vue'
 import ProgressBar from '../components/ProgressBar.vue'
 import ChatGroupEditor from '../components/ChatGroupEditor.vue'
+import DownloadCompleteNotification from '../components/DownloadCompleteNotification.vue'
 import ipc from '../utils/ipc'
 import getAvatarUrl from '../../utils/getAvatarUrl'
 import createRoom from '../../utils/createRoom'
@@ -354,6 +389,7 @@ export default {
         Room,
         Stickers,
         SideBarIcon,
+        GroupChatIcon,
         TheRoomsPanel,
         TheContactsPanel,
         TheGroupMemberPanel,
@@ -361,6 +397,7 @@ export default {
         MultipaneResizer,
         ProgressBar,
         ChatGroupEditor,
+        DownloadCompleteNotification,
     },
     data() {
         return {
@@ -369,6 +406,7 @@ export default {
             selectedRoomId: 0,
             account: 0,
             messagesLoaded: false,
+            dbUpgrade: { active: false, step: 0, total: 0, message: '' },
             panel: '',
             offline: false,
             offlineReason: '',
@@ -407,6 +445,7 @@ export default {
             showSinglePanel: false,
             removeGroupNameEmotes: false,
             usePanguJsRecv: false,
+            hideTitleBar: false,
             showPanel: 'contact', // 'chat' or 'contact', 只有showSinglePanel为true有效
             notifyProgresses: new Map(),
             sendDiceShown: false,
@@ -424,17 +463,21 @@ export default {
             stickerPanelBottom: false, // 是否启用底部表情面板模式
             stickerPanelHeight: 320, // 底部模式时的面板高度（px）
             // 聊天分组滚动条
-            chatGroupScrollTop: 0,
             chatGroupContainerHeight: 0,
             chatGroupScrollHeight: 0,
             chatGroupIsDragging: false,
             chatGroupScrollbarPadding: 3,
+            // roomId → groupNames Set 反向索引，避免 rooms×groups 双重循环
+            _roomToGroupIndex: null,
+            // 标记了 includeAllPersonal 的分组名列表
+            _includeAllPersonalGroupNames: null,
         }
     },
     async created() {
         //region set status
         const STORE_PATH = await ipc.getStorePath()
         const ver = await ipc.getVersion()
+        this.dbUpgrade = await ipc.getDbUpgradeProgress()
         const settings = await ipc.getSettings()
         this.linkify = settings.linkify
         this.disableChatGroups = settings.disableChatGroups
@@ -444,10 +487,14 @@ export default {
         this.useSinglePanel = settings.useSinglePanel
         this.removeGroupNameEmotes = settings.removeGroupNameEmotes
         this.usePanguJsRecv = settings.usePanguJsRecv
+        this.hideTitleBar = settings.hideTitleBar
         this.stickerPanelBottom = settings.stickerPanelBottom
         this.stickerPanelHeight = settings.stickerPanelHeight || 320
         //endregion
         //region listener
+        ipcRenderer.on('dbUpgradeProgress', (_, progress) => {
+            this.dbUpgrade = progress
+        })
         document.addEventListener('dragover', (e) => {
             e.preventDefault()
             e.stopPropagation()
@@ -545,9 +592,11 @@ export default {
                         this.selectChatGroup('chats')
                         break
                     case '2':
-                        this.selectChatGroup('private')
+                        this.selectChatGroup('group')
                         break
                     case '3':
+                        this.selectChatGroup('private')
+                        break
                     case '4':
                     case '5':
                     case '6':
@@ -555,8 +604,8 @@ export default {
                     case '8':
                     case '9':
                         const n = Number(e.key)
-                        if (this.chatGroups[n - 3]) {
-                            this.selectChatGroup(this.chatGroups[n - 3].name)
+                        if (this.chatGroups[n - 4]) {
+                            this.selectChatGroup(this.chatGroups[n - 4].name)
                         }
                         break
                     default:
@@ -578,25 +627,21 @@ export default {
         ipcRenderer.on('setDisableChatGroupsSeeting', (_, p) => {
             this.disableChatGroups = p
             this.selectedChatGroup = 'chats'
+            if (p) {
+                this.chatGroupsUnreadCount = {}
+            } else {
+                this._rebuildRoomToGroupIndex()
+                this._recomputeChatGroupsUnreadCount()
+            }
         })
         ipcRenderer.on('setDisableChatGroupsRedPointSeeting', (_, p) => {
             this.disableChatGroupsRedPoint = p
-            this.chatGroupsUnreadCount = {}
-            if (p) return
-            this.rooms.forEach((e) => {
-                if (e.priority >= this.priority || e.at) {
-                    const groups = this.chatGroups.filter(
-                        (g) => g.rooms.includes(e.roomId) || (g.includeAllPersonal && e.roomId > 0),
-                    )
-                    if (e.unreadCount > 0) {
-                        this.chatGroupsUnreadCount['chats'] = true
-                        if (e.roomId > 0) this.chatGroupsUnreadCount['personal'] = true
-                        groups.forEach((g) => {
-                            this.chatGroupsUnreadCount[g.name] = true
-                        })
-                    }
-                }
-            })
+            if (!p) {
+                this._rebuildRoomToGroupIndex()
+                this._recomputeChatGroupsUnreadCount()
+            } else {
+                this.chatGroupsUnreadCount = {}
+            }
         })
         ipcRenderer.on('openGroupMemberPanel', (_, p) => {
             this.groupmemberShown = p.shown
@@ -639,6 +684,19 @@ export default {
             if (instance) {
                 instance.notification.close()
             }
+        })
+        ipcRenderer.on('notifyDownloadComplete', (_, { fileName, filePath }) => {
+            const message = this.$createElement(DownloadCompleteNotification, {
+                props: { fileName },
+                on: { open: () => ipc.openDownloadedFile(filePath) },
+            })
+            this.$notify.success({
+                title: '下载完成',
+                message,
+                customClass: 'el-notification-download-complete',
+                offset: 80,
+                duration: 10000,
+            })
         })
         ipcRenderer.on('message', (_, p) => this.$message(p))
         ipcRenderer.on('messageError', (_, p) => this.$message.error(p))
@@ -742,6 +800,7 @@ export default {
                 }
             }
             this.rooms = [...oldRooms.slice(0, left), room, ...oldRooms.slice(left)]
+            this._recomputeChatGroupsUnreadCount()
         })
         ipcRenderer.on('addMessage', (_, { roomId, message }) => {
             message.__v_skip = true
@@ -810,12 +869,16 @@ export default {
             this.offlineReason = msg
             this.offline = true
         })
-        ipcRenderer.on('clearCurrentRoomUnread', () => (this.selectedRoom.unreadCount = 0))
+        ipcRenderer.on('clearCurrentRoomUnread', () => {
+            this.selectedRoom.unreadCount = 0
+            this._recomputeChatGroupsUnreadCount()
+        })
         ipcRenderer.on('clearRoomUnread', (_, roomId) => {
             const room = this.rooms.find((e) => e.roomId === roomId)
             if (room) {
                 room.unreadCount = 0
                 room.at = false
+                this._recomputeChatGroupsUnreadCount()
             }
         })
         ipcRenderer.on('updatePriority', (_, p) => (this.priority = p))
@@ -909,7 +972,9 @@ Chromium ${process.versions.chrome}`
             if (!room) room = this.rooms.find((e) => e.roomId === roomId)
             if (!roomId) roomId = room.roomId
 
-            const processed = await processFiles(files || [], (msg) => this.$message.warning(msg))
+            const hasImages = (files || []).some((file) => file.type.includes('image'))
+            const compressImages = hasImages ? (await ipc.getSettings()).compressImages : false
+            const processed = await processFiles(files || [], (msg) => this.$message.warning(msg), compressImages)
             const media = [...(extraMedia || []), ...processed.media]
 
             if (resend) ipc.deleteMessage(roomId, resend)
@@ -1007,7 +1072,7 @@ Chromium ${process.versions.chrome}`
             const messageType = await ipc.getMessgeTypeSetting()
             if (this.selectedRoom) {
                 const roomRef = this.$refs.room
-                const content = roomRef?.$refs?.roomTextarea?.message || ''
+                const content = roomRef?.getMessageText() || ''
                 const replyMessage = roomRef?.messageReply || null
                 this.sendMessage({
                     content,
@@ -1197,7 +1262,7 @@ Chromium ${process.versions.chrome}`
             this.$refs.room.focusTextarea()
         },
         openForward(e) {
-            ipc.openForward(e.resId, e.fileName)
+            ipc.openForward(e.resId, e.fileName, e.fallbackResId)
         },
         stopFetchingHistory() {
             ipc.stopFetchMessage()
@@ -1265,39 +1330,12 @@ Chromium ${process.versions.chrome}`
             this.forwardAnonymous = anonymous
             console.log('forwardMulti', multi, 'forwardAnonymous', anonymous)
         },
-        editChatGroups() {
-            this.$prompt('请输入新聊天分组名字', '提示', {
-                confirmButtonText: '确定',
-                cancelButtonText: '取消',
-                inputValidator: (value) => {
-                    if (value.length > 10) {
-                        return '聊天分组名字不能超过10个字符'
-                    }
-                },
-            }).then(({ value }) => {
-                if (!value) {
-                    this.$message({
-                        type: 'error',
-                        message: '请输入新聊天分组名字',
-                    })
-                    return
-                }
-                if (this.chatGroups.find((e) => e.name === value) || value === 'chats') {
-                    this.$message({
-                        type: 'error',
-                        message: '聊天分组名字重复',
-                    })
-                    return
-                }
-                ipc.addChatGroup({ name: value, index: this.chatGroups.length + 1, rooms: [-1] })
-                this.chatGroups.push({ name: value, index: this.chatGroups.length + 1, rooms: [-1] })
-            })
-        },
         onChatGroupsSaved(newGroups) {
             this.chatGroups = newGroups
             // 如果当前选中的分组被删除了，切回全部
             if (
                 this.selectedChatGroup !== 'chats' &&
+                this.selectedChatGroup !== 'group' &&
                 this.selectedChatGroup !== 'private' &&
                 !newGroups.find((g) => g.name === this.selectedChatGroup)
             ) {
@@ -1356,12 +1394,26 @@ Chromium ${process.versions.chrome}`
             }
         },
         onChatGroupScroll(e) {
-            this.chatGroupScrollTop = e.target.scrollTop
+            this._chatGroupPendingScrollTop = e.target.scrollTop
+            if (this._chatGroupScrollFrame) return
+            this._chatGroupScrollFrame = requestAnimationFrame(() => {
+                this._chatGroupScrollFrame = null
+                this._updateChatGroupScrollbarPosition(this._chatGroupPendingScrollTop)
+            })
+        },
+        _updateChatGroupScrollbarPosition(scrollTop) {
+            const thumb = this.$refs.chatGroupScrollbarThumb
+            if (!thumb) return
+
+            const maxScroll = this.chatGroupScrollHeight - this.chatGroupContainerHeight
+            const maxOffset = this.groupTrackHeight - this.groupThumbHeight
+            const ratio = maxScroll > 0 ? Math.max(0, Math.min(1, scrollTop / maxScroll)) : 0
+            thumb.style.transform = `translateY(${this.chatGroupScrollbarPadding + ratio * maxOffset}px)`
         },
         onGroupThumbMouseDown(e) {
             this.chatGroupIsDragging = true
             this._groupDragStartY = e.clientY
-            this._groupDragStartScrollTop = this.chatGroupScrollTop
+            this._groupDragStartScrollTop = this.$refs.chatGroupContainer?.scrollTop || 0
             this._onGroupMouseMove = (ev) => this.onGroupThumbMouseMove(ev)
             this._onGroupMouseUp = () => this.onGroupThumbMouseUp()
             document.addEventListener('mousemove', this._onGroupMouseMove)
@@ -1501,6 +1553,51 @@ Chromium ${process.versions.chrome}`
             }
             if (unreadRoom) this.chroom(unreadRoom)
         },
+        /** 重建 roomId → groupNames 反向索引（chatGroups 变化时调用） */
+        _rebuildRoomToGroupIndex() {
+            const idx = new Map()
+            const includeAllPersonalNames = new Set()
+            for (const g of this.chatGroups) {
+                if (g.includeAllPersonal) {
+                    includeAllPersonalNames.add(g.name)
+                }
+                for (const roomId of g.rooms) {
+                    if (!idx.has(roomId)) idx.set(roomId, new Set())
+                    idx.get(roomId).add(g.name)
+                }
+            }
+            this._roomToGroupIndex = idx
+            this._includeAllPersonalGroupNames = includeAllPersonalNames
+        },
+        /** 利用反向索引计算各聊天分组中满足通知条件的会话数量（O(rooms)） */
+        _recomputeChatGroupsUnreadCount() {
+            if (this.disableChatGroups || this.disableChatGroupsRedPoint) {
+                this.chatGroupsUnreadCount = {}
+                return
+            }
+            const unread = {}
+            const selectedId = this.selectedRoomId
+            for (const e of this.rooms) {
+                if (selectedId && e.roomId === selectedId) continue
+                if (e.unreadCount > 0 && (e.priority >= this.priority || e.at)) {
+                    unread['chats'] = (unread['chats'] || 0) + 1
+                    if (e.roomId < 0) unread['group'] = (unread['group'] || 0) + 1
+                    if (e.roomId > 0) unread['private'] = (unread['private'] || 0) + 1
+                    // 反向索引 O(1) 查找该 room 所属的自定义分组
+                    const groups = new Set(this._roomToGroupIndex?.get(e.roomId) || [])
+                    // includeAllPersonal 分组匹配所有私聊；Set 可避免和显式分组重复计数
+                    if (e.roomId > 0 && this._includeAllPersonalGroupNames) {
+                        for (const gName of this._includeAllPersonalGroupNames) {
+                            groups.add(gName)
+                        }
+                    }
+                    for (const gName of groups) {
+                        unread[gName] = (unread[gName] || 0) + 1
+                    }
+                }
+            }
+            this.chatGroupsUnreadCount = unread
+        },
     },
     computed: {
         cssVars() {
@@ -1516,6 +1613,8 @@ Chromium ${process.versions.chrome}`
             switch (this.selectedChatGroup) {
                 case 'chats':
                     return this.rooms
+                case 'group':
+                    return this.rooms.filter((e) => e.roomId < 0)
                 case 'private':
                     return this.rooms.filter((e) => e.roomId > 0)
                 default:
@@ -1537,13 +1636,6 @@ Chromium ${process.versions.chrome}`
         groupTrackHeight() {
             return this.chatGroupContainerHeight - this.chatGroupScrollbarPadding * 2
         },
-        groupThumbTop() {
-            if (this.chatGroupScrollHeight <= 0) return 0
-            const maxScroll = this.chatGroupScrollHeight - this.chatGroupContainerHeight
-            if (maxScroll <= 0) return 0
-            const maxOffset = this.groupTrackHeight - this.groupThumbHeight
-            return this.chatGroupScrollbarPadding + (this.chatGroupScrollTop / maxScroll) * maxOffset
-        },
     },
     mounted() {
         this._updateChatGroupContainer = () => {
@@ -1551,6 +1643,7 @@ Chromium ${process.versions.chrome}`
             if (el) {
                 this.chatGroupContainerHeight = el.clientHeight
                 this.chatGroupScrollHeight = el.scrollHeight
+                this.$nextTick(() => this._updateChatGroupScrollbarPosition(el.scrollTop))
             }
         }
         // 等待 DOM 完全渲染后再测量
@@ -1561,9 +1654,22 @@ Chromium ${process.versions.chrome}`
             if (el) this._chatGroupResizeObserver.observe(el)
         })
     },
+    beforeDestroy() {
+        if (this._chatGroupResizeObserver) {
+            this._chatGroupResizeObserver.disconnect()
+            this._chatGroupResizeObserver = null
+        }
+        if (this._chatGroupScrollFrame) {
+            cancelAnimationFrame(this._chatGroupScrollFrame)
+            this._chatGroupScrollFrame = null
+        }
+        if (this._onGroupMouseUp) this.onGroupThumbMouseUp()
+    },
     watch: {
         chatGroups: {
             handler() {
+                this._rebuildRoomToGroupIndex()
+                this._recomputeChatGroupsUnreadCount()
                 this.$nextTick(this._updateChatGroupContainer)
             },
             deep: true,
@@ -1592,43 +1698,14 @@ Chromium ${process.versions.chrome}`
                 }, 30000)
             }
         },
-        rooms(n) {
-            if (this.disableChatGroups || this.disableChatGroupsRedPoint) return
-            this.chatGroupsUnreadCount = {}
-            n.forEach((e) => {
-                if (e.priority >= this.priority || e.at) {
-                    const groups = this.chatGroups.filter(
-                        (g) => g.rooms.includes(e.roomId) || (g.includeAllPersonal && e.roomId > 0),
-                    )
-                    if (e.unreadCount > 0) {
-                        this.chatGroupsUnreadCount['chats'] = true
-                        // 屎山还在堆
-                        if (e.roomId > 0) this.chatGroupsUnreadCount['personal'] = true
-                        groups.forEach((g) => {
-                            this.chatGroupsUnreadCount[g.name] = true
-                        })
-                    }
-                }
-            })
+        rooms() {
+            this._recomputeChatGroupsUnreadCount()
         },
-        selectedRoomId(n) {
-            if (this.disableChatGroups || this.disableChatGroupsRedPoint) return
-            this.chatGroupsUnreadCount = {}
-            this.rooms.forEach((e) => {
-                if (e.roomId === n) return
-                if (e.priority >= this.priority || e.at) {
-                    const groups = this.chatGroups.filter(
-                        (g) => g.rooms.includes(e.roomId) || (g.includeAllPersonal && e.roomId > 0),
-                    )
-                    if (e.unreadCount > 0) {
-                        this.chatGroupsUnreadCount['chats'] = true
-                        if (e.roomId > 0) this.chatGroupsUnreadCount['personal'] = true
-                        groups.forEach((g) => {
-                            this.chatGroupsUnreadCount[g.name] = true
-                        })
-                    }
-                }
-            })
+        selectedRoomId() {
+            this._recomputeChatGroupsUnreadCount()
+        },
+        priority() {
+            this._recomputeChatGroupsUnreadCount()
         },
     },
 }
@@ -1835,6 +1912,7 @@ main div {
     border-radius: 2px;
     background-color: rgba(255, 255, 255, 0.3);
     transition: background-color 0.15s;
+    will-change: transform;
 }
 .custom-scrollbar-group:not(.is-dragging) .custom-scrollbar-group-thumb:hover,
 .custom-scrollbar-group.is-dragging .custom-scrollbar-group-thumb {
@@ -1846,6 +1924,21 @@ main div {
 
     .el-button {
         flex-grow: 1;
+    }
+}
+
+.random-dialog-footer {
+    display: flex;
+    align-items: center;
+    justify-content: flex-end;
+    gap: 10px;
+
+    .el-checkbox {
+        margin-right: 8px;
+    }
+
+    .el-button + .el-button {
+        margin-left: 0;
     }
 }
 </style>

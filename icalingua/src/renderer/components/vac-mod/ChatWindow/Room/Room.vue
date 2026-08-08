@@ -1,5 +1,9 @@
 <template>
-    <div v-show="(isMobile && !showRoomsList) || !isMobile || singleRoom" class="vac-col-messages">
+    <div
+        v-show="(isMobile && !showRoomsList) || !isMobile || singleRoom"
+        class="vac-col-messages"
+        :class="{ 'vac-empty-window-drag-region': windowDragEnabled && !room.roomId }"
+    >
         <slot v-if="(!rooms.length && !loadingRooms) || (!room.roomId && !loadFirstRoom)" name="no-room-selected">
             <div class="vac-container-center vac-room-empty">
                 <div>{{ textMessages.ROOM_EMPTY }}</div>
@@ -19,19 +23,25 @@
             :members-count="membersCount"
             :showSinglePanel="showSinglePanel"
             :removeEmotes="removeHeaderEmotes"
+            :window-drag-enabled="windowDragEnabled"
             @toggle-rooms-list="$emit('toggle-rooms-list')"
             @menu-action-handler="$emit('menu-action-handler', $event)"
             @pokefriend="$emit('pokefriend')"
             @room-menu="roomMenu"
+            @open-group-announcements="openGroupAnnouncements"
+            @open-group-files="openGroupFiles"
+            @open-group-album="openGroupAlbum"
+            @open-group-essence="openGroupEssence"
             @back-contact="$emit('back-contact')"
             @open-group-member-panel="$emit('open-group-member-panel')"
         >
-            <template v-for="(index, name) in $scopedSlots" #[name]="data">
+            <template v-for="(index, name) in $scopedSlots" v-if="name !== 'messages-top'" #[name]="data">
                 <slot :name="name" v-bind="data" />
             </template>
         </room-header>
 
         <div ref="scrollContainer" class="vac-container-scroll" @scroll="containerScroll">
+            <slot name="messages-top" />
             <loader :show="loadingMessages" />
             <div
                 ref="messagesContainer"
@@ -99,6 +109,7 @@
                                 :message="m"
                                 :index="i + visibleViewport.head"
                                 :messages="messages"
+                                :audio-session="getAudioSession(m)"
                                 :edited-message="editedMessage"
                                 :message-actions="messageActions"
                                 :room-users="room.users"
@@ -128,6 +139,7 @@
                                 @del-msg-to-forward="delmsgToForward"
                                 @scroll-to-message="(id) => scrollToMessage(id, true)"
                                 @reply="replyMessage(m, $event)"
+                                @inline-command="useMessageInlineCommand(m, $event)"
                                 :hide-chat-image-by-default="hideChatImageByDefault"
                                 :hide-chat-video-by-default="hideChatVideoByDefault"
                                 :local-image-viewer-by-default="localImageViewerByDefault"
@@ -211,7 +223,7 @@
             </transition>
         </div>
         <div
-            v-show="Object.keys(room).length"
+            v-show="hasValidRoom"
             ref="roomFooter"
             class="vac-room-footer"
             :class="{ 'vac-app-box-shadow': (showFooter && (messageReply || editAndResend)) || showForwardPanel }"
@@ -224,6 +236,7 @@
                 :showForwardPanel="showForwardPanel"
                 :usePanguJs="usePanguJsRecv"
                 @reset-message="resetMessage"
+                @open-forward="$emit('open-forward', $event)"
             >
                 <template v-for="(index, name) in $scopedSlots" #[name]="data">
                     <slot :name="name" v-bind="data" />
@@ -268,6 +281,62 @@
             </transition>
 
             <div class="vac-box-footer" v-show="showFooter">
+                <el-dialog
+                    title="发送语音"
+                    :visible.sync="audioDialogVisible"
+                    width="360px"
+                    append-to-body
+                    :close-on-click-modal="false"
+                    :close-on-press-escape="false"
+                    :show-close="!isAudioSending"
+                    @close="handleAudioDialogClose"
+                >
+                    <div class="vac-audio-dialog-body">
+                        <div class="vac-audio-dialog-status">
+                            <span v-if="isAudioRecording" class="vac-audio-recording-dot"></span>
+                            <i v-else-if="isAudioStarting" class="el-icon-loading"></i>
+                            <span>{{ audioRecordingStatus }}</span>
+                            <strong>{{ formatAudioDuration(audioDuration) }}</strong>
+                        </div>
+
+                        <p v-if="isAudioStarting || isAudioRecording" class="vac-audio-dialog-hint">
+                            {{ audioRecordingHint }}
+                        </p>
+                        <message-audio
+                            v-else-if="audioRecordUrl"
+                            class="vac-audio-preview"
+                            :src="audioRecordUrl"
+                            :audio-session="audioPreviewSession"
+                        />
+                    </div>
+
+                    <span slot="footer" class="dialog-footer">
+                        <template v-if="isAudioStarting || isAudioRecording">
+                            <el-button @click="cancelAudioRecording">取消</el-button>
+                            <el-button
+                                type="primary"
+                                :loading="isAudioStarting"
+                                :disabled="isAudioStarting"
+                                @click="stopAudioRecording"
+                            >
+                                完成
+                            </el-button>
+                        </template>
+                        <template v-else>
+                            <el-button :disabled="isAudioSending" @click="cancelAudioRecording">取消</el-button>
+                            <el-button :disabled="isAudioSending" @click="reRecordAudio">重录</el-button>
+                            <el-button
+                                type="primary"
+                                :loading="isAudioSending"
+                                :disabled="isAudioSending"
+                                @click="sendAudioRecording"
+                            >
+                                发送
+                            </el-button>
+                        </template>
+                    </span>
+                </el-dialog>
+
                 <div v-if="videoFiles.length" class="vac-media-container">
                     <div class="vac-svg-button vac-icon-media" @click="resetMediaFile">
                         <slot name="image-close-icon">
@@ -293,11 +362,8 @@
                             <svg-icon name="file" />
                         </slot>
                     </div>
-                    <div v-if="files[0] && files[0].audio" class="vac-file-message-room">
-                        {{ files[0].name }}
-                    </div>
-                    <div v-else class="vac-file-message-room">
-                        {{ $refs.roomTextarea.message }}
+                    <div class="vac-file-message-room" :title="files[0].name + '.' + files[0].extension">
+                        {{ files[0].name + '.' + files[0].extension }}
                     </div>
                     <div class="vac-svg-button vac-icon-remove" @click="resetMessage(null, true)">
                         <slot name="file-close-icon">
@@ -330,7 +396,10 @@
                         v-slot="{ id, name }"
                         :list="
                             groupMembers
-                                ? groupMembers.map(({ card, nickname, user_id }) => [card || nickname, user_id])
+                                ? groupMembers.map(({ card, nickname, user_id }) => [
+                                      card || nickname || String(user_id),
+                                      user_id,
+                                  ])
                                 : []
                         "
                         description="member(s)"
@@ -346,7 +415,7 @@
                     </SearchInput>
                 </transition>
 
-                <room-text-area
+                <textarea
                     v-show="!files.length || imageFiles.length || videoFiles.length"
                     ref="roomTextarea"
                     :placeholder="textMessages.TYPE_MESSAGE"
@@ -361,7 +430,8 @@
                         'padding-left': `${mediaDimensions ? mediaDimensions.width - 10 : 12}px`,
                     }"
                     @input="onChangeInput"
-                    @click-right="textctx"
+                    @keydown="onTextareaKeydown"
+                    @click.right="textctx"
                     spellcheck="false"
                 />
 
@@ -383,6 +453,21 @@
 
                     <div class="vac-svg-button" @click="$emit('stickers-panel')" @click.right="stickersMenu($event)">
                         <svg-icon name="emoji" />
+                    </div>
+
+                    <div
+                        v-if="showAudio"
+                        class="vac-svg-button vac-record-button"
+                        :class="{
+                            'vac-recording': isAudioRecording,
+                            'vac-recording-pending': isAudioStarting || isAudioSending,
+                        }"
+                        :title="isAudioStarting ? '正在启动麦克风' : isAudioRecording ? '停止录音' : '录音'"
+                        @click="toggleAudioRecording"
+                    >
+                        <slot name="audio-icon">
+                            <svg-icon :name="isAudioRecording ? 'microphone-off' : 'microphone'" />
+                        </slot>
                     </div>
 
                     <el-popover placement="top" trigger="hover">
@@ -462,6 +547,7 @@
 </template>
 
 <script>
+import fs from 'fs'
 import path from 'path'
 import { ipcRenderer, webUtils } from 'electron'
 import _ from 'lodash'
@@ -476,8 +562,8 @@ import SvgIcon from '../../components/SvgIcon'
 import RoomHeader from './RoomHeader'
 import RoomMessageReply from './RoomMessageReply'
 import RoomForwardMessage from './RoomForwardMessage'
-import RoomTextArea from './RoomTextArea'
 import Message from '../Message/Message'
+import MessageAudio from '../Message/MessageAudio'
 import SearchInput from '../../../SearchInput'
 
 import faceNames from '../../../../../../static/faceNames'
@@ -486,8 +572,12 @@ import getStaticPath from '../../../../../utils/getStaticPath'
 import ipc from '../../../../utils/ipc'
 import { detectMobile, iOSDevice } from '../../utils/mobileDetection'
 import { isImageFile, isVideoFile, isAudioFile } from '../../utils/mediaFile'
+import { getOrderedMessageParts } from '../../utils/messageMediaOrder'
+import Recorder from '../../utils/recorder'
 
 const faceDir = path.join(getStaticPath(), 'face')
+const messageDraftStorageKey = 'icalingua:message-draft'
+const messageDraftThrottleMs = 500
 
 /** @type 'Enter'|'CtrlEnter'|'ShiftEnter' */
 let keyToSendMessage
@@ -504,8 +594,8 @@ export default {
         RoomHeader,
         RoomMessageReply,
         RoomForwardMessage,
-        RoomTextArea,
         Message,
+        MessageAudio,
         SearchInput,
     },
     directives: {
@@ -548,16 +638,15 @@ export default {
         isSteamVrRunning: { type: Boolean, required: false, default: false },
         canLoadAfter: { type: Boolean, required: false, default: false },
         standalone: { type: Boolean, default: false },
+        windowDragEnabled: { type: Boolean, default: false },
     },
     data() {
         return {
-            message: '',
             editedMessage: {},
             messageReply: null,
             loadingMessages: false,
             loadingHeadMessages: false,
             loadingTailMessages: false,
-            file: null,
             files: [],
             imageFiles: [],
             videoFiles: [],
@@ -611,6 +700,20 @@ export default {
             checkCanScrollTimer: null,
             scrollToBottomTimer: null,
             pasteIcon: `file://${__static}/Clipboard.svg`,
+            audioSessions: {},
+            audioPreviewSession: { audio: new Audio() },
+            audioRecorder: null,
+            isAudioStarting: false,
+            isAudioRecording: false,
+            isAudioSending: false,
+            audioDialogVisible: false,
+            audioRecord: null,
+            audioRecordUrl: '',
+            audioDuration: 0,
+            audioDurationTimer: null,
+            audioRecordingStartedAt: 0,
+            messageDraftSaveTimer: null,
+            pendingMessageDraft: '',
         }
     },
     computed: {
@@ -620,6 +723,10 @@ export default {
         },
         room() {
             return this.rooms.find((room) => room.roomId === this.roomId) || {}
+        },
+        hasValidRoom() {
+            const roomId = Number(this.room.roomId)
+            return Number.isFinite(roomId) && roomId !== 0 && Object.keys(this.room).length
         },
         showNoMessages() {
             return this.room.roomId && !this.messages.length && !this.loadingMessages && !this.loadingRooms
@@ -633,8 +740,22 @@ export default {
             // 每条消息估算高度 60px，乘以 5 倍缓冲确保快速滚动不会出现空白
             return Math.ceil(height / 60) * 5
         },
+        audioRecordingStatus() {
+            if (this.isAudioStarting) return '正在启动麦克风'
+            if (this.isAudioRecording) return '正在录音'
+            return '录音预览'
+        },
+        audioRecordingHint() {
+            return this.isAudioStarting ? '准备完成后再开始说话' : '点击“完成”结束录音'
+        },
     },
     watch: {
+        hasValidRoom(val) {
+            if (val) this.scheduleTextareaResize()
+        },
+        showFooter(val) {
+            if (val) this.scheduleTextareaResize()
+        },
         canLoadAfter(val) {
             // 当 canLoadAfter 变为 true 且已在底部时，自动触发加载
             if (
@@ -651,6 +772,7 @@ export default {
         },
         async room(newVal, oldVal) {
             if (newVal.roomId && newVal.roomId !== oldVal.roomId) {
+                this.clearAudioSessions()
                 this.loadingMessages = true
                 this.scrollIcon = false
                 this.scrollMessagesCount = 0
@@ -790,139 +912,13 @@ export default {
                 else this.infiniteState.head.complete()
             }
         },
-        files(val) {
-            this.isMessageEmpty = (!val || !val.length) && !this.$refs.roomTextarea.message.trim()
+        files() {
+            this.updateMessageEmptyState()
         },
     },
     async mounted() {
         this.newMessages = []
-        this.$refs.roomTextarea.$refs.roomTextarea.addEventListener('keydown', (e) => {
-            if (e.isComposing) return
-            if (e.key === 'Enter') {
-                switch (keyToSendMessage) {
-                    case 'Enter':
-                        if (e.ctrlKey) {
-                            let selectionStart = this.$refs.roomTextarea.$refs.roomTextarea.selectionStart
-                            let selectionEnd = this.$refs.roomTextarea.$refs.roomTextarea.selectionEnd
-                            this.$refs.roomTextarea.message =
-                                this.$refs.roomTextarea.message.substr(0, selectionStart) +
-                                '\n' +
-                                this.$refs.roomTextarea.message.substr(selectionEnd)
-                            setTimeout(() => this.onChangeInput(), 0)
-                        } else if (e.shiftKey) {
-                            setTimeout(() => this.onChangeInput(), 0)
-                        } else {
-                            this.sendMessage()
-                            e.preventDefault()
-                        }
-                        break
-                    case 'CtrlEnter':
-                        if (!e.ctrlKey) {
-                            setTimeout(() => this.onChangeInput(), 0)
-                        } else {
-                            this.sendMessage()
-                            e.preventDefault()
-                        }
-                        break
-                    case 'ShiftEnter':
-                        if (e.ctrlKey) {
-                            let selectionStart = this.$refs.roomTextarea.$refs.roomTextarea.selectionStart
-                            let selectionEnd = this.$refs.roomTextarea.$refs.roomTextarea.selectionEnd
-                            this.$refs.roomTextarea.message =
-                                this.$refs.roomTextarea.message.substr(0, selectionStart) +
-                                '\n' +
-                                this.$refs.roomTextarea.message.substr(selectionEnd)
-                            setTimeout(() => this.onChangeInput(), 0)
-                        } else if (!e.shiftKey) {
-                            setTimeout(() => this.onChangeInput(), 0)
-                        } else {
-                            this.sendMessage()
-                            e.preventDefault()
-                        }
-                        break
-                    default:
-                        console.log('qwq')
-                }
-            } else if (e.key === 'ArrowUp') {
-                if (e.ctrlKey) {
-                    // Ctrl + ↑ 选择上一条消息进行回复
-                    e.preventDefault()
-                    const nonSystemMessages = this.messages.filter((msg) => !msg.system && !msg.flash)
-                    if (!nonSystemMessages.length) return
-
-                    if (this.messageReply === null) {
-                        // 如果当前没有回复消息，选择最后一条消息
-                        this.messageReply = nonSystemMessages[nonSystemMessages.length - 1]
-                    } else {
-                        // 如果已经有回复消息，找到当前消息的位置，向前切换
-                        const currentIndex = nonSystemMessages.findIndex((msg) => msg._id === this.messageReply._id)
-                        if (currentIndex > 0) {
-                            this.messageReply = nonSystemMessages[currentIndex - 1]
-                        }
-                    }
-                    // 高亮选中的消息
-                    if (this.messageReply) {
-                        this.$nextTick(() => this.highlightMessage(this.messageReply._id))
-                    }
-                    this.focusTextarea()
-                    return
-                }
-
-                if (this.$refs.roomTextarea.message) return
-                //编辑重发上一条消息
-                e.preventDefault()
-                const ownMessages = this.messages.filter((e) => e.senderId === this.currentUserId)
-                if (!ownMessages.length) return
-                const lastMessage = ownMessages[ownMessages.length - 1]
-                if (lastMessage.file && lastMessage.file.type.startsWith('image')) {
-                    this.onPasteGif(lastMessage.file.url)
-                } else if (lastMessage.file && lastMessage.file.type.startsWith('audio')) {
-                    return
-                } else if (lastMessage.file) {
-                    return
-                    this.files = [lastMessage.file]
-                }
-                this.messageReply = lastMessage.replyMessage
-                this.$refs.roomTextarea.message = lastMessage.content
-                this.$nextTick(
-                    () =>
-                        (this.$refs.roomTextarea.$refs.roomTextarea.selectionStart =
-                            this.$refs.roomTextarea.$refs.roomTextarea.selectionEnd =
-                                this.$refs.roomTextarea.message.length),
-                )
-                this.editAndResend = lastMessage._id
-            } else if (e.key === 'ArrowDown' && e.ctrlKey) {
-                // Ctrl + ↓ 选择下一条消息进行回复
-                e.preventDefault()
-                if (this.messageReply === null) return
-
-                const nonSystemMessages = this.messages.filter((msg) => !msg.system && !msg.flash)
-                if (!nonSystemMessages.length) return
-
-                // 找到当前消息的位置，向后切换
-                const currentIndex = nonSystemMessages.findIndex((msg) => msg._id === this.messageReply._id)
-                if (currentIndex !== -1) {
-                    if (currentIndex < nonSystemMessages.length - 1) {
-                        // 不是最后一条，切换到下一条
-                        this.messageReply = nonSystemMessages[currentIndex + 1]
-                        // 高亮选中的消息
-                        this.$nextTick(() => this.highlightMessage(this.messageReply._id))
-                    } else {
-                        // 已经是最后一条消息，取消回复
-                        this.messageReply = null
-                    }
-                }
-                this.focusTextarea()
-            } else if (e.key === 'e' && e.ctrlKey) {
-                // 快捷表情选择
-                this.isQuickFaceOn = true
-                this.$nextTick(() => this.$refs.quickface.focus())
-            } else if (e.key === 'm' && e.ctrlKey && this.room.roomId < 0) {
-                // 快捷 at 选择
-                this.isQuickAtOn = true
-                this.$nextTick(() => this.$refs.quickat.focus())
-            }
-        })
+        this.restoreMessageDraft()
 
         window.addEventListener('paste', (event) => {
             console.log(event.clipboardData.files)
@@ -957,7 +953,7 @@ export default {
             //纯文本
             if (event.dataTransfer.getData('text')) {
                 if (event.target.className === 'vac-textarea') {
-                    this.$refs.roomTextarea.message += event.dataTransfer.getData('text')
+                    this.appendMessageText(event.dataTransfer.getData('text'))
                     this.focusTextarea()
                     this.$nextTick(() => this.resizeTextarea())
                 }
@@ -1005,12 +1001,12 @@ export default {
             keyToSendMessage = key
         })
         ipcRenderer.on('addMessageText', (_, message) => {
-            this.$refs.roomTextarea.message += message
+            this.appendMessageText(message)
             this.focusTextarea()
             this.$nextTick(() => this.resizeTextarea())
         })
         ipcRenderer.on('setMessageText', (_, message) => {
-            this.$refs.roomTextarea.message = message
+            this.setMessageText(message)
             this.focusTextarea()
             this.$nextTick(() => this.resizeTextarea())
         })
@@ -1048,6 +1044,8 @@ export default {
         })
     },
     beforeDestroy() {
+        this.saveMessageDraft(this.getMessageText(), true)
+        this.disposeAudioRecorder()
         if (this.onScrolling) {
             clearTimeout(this.onScrolling)
             this.onScrolling = null
@@ -1060,8 +1058,395 @@ export default {
             clearTimeout(this.checkCanScrollTimer)
             this.checkCanScrollTimer = null
         }
+        this.clearAudioSessions()
     },
     methods: {
+        createAudioRecorder() {
+            if (this.audioRecorder) return this.audioRecorder
+
+            this.audioRecorder = new Recorder({
+                sampleRate: 24000,
+                bitRate: 16,
+                afterRecording: (record) => this.handleAudioRecord(record),
+                micFailed: (error) => this.handleAudioRecordError(error),
+            })
+            return this.audioRecorder
+        },
+        async startAudioRecording() {
+            this.clearAudioRecord()
+            this.audioDialogVisible = true
+            this.audioDuration = 0
+            this.isAudioStarting = true
+            this.isAudioRecording = false
+            try {
+                const recorder = this.createAudioRecorder()
+                const result = await recorder.start()
+                if (!result) return
+                if (!this.isAudioStarting || !this.audioDialogVisible) {
+                    recorder.cancel()
+                    return
+                }
+
+                this.audioDuration = Number(recorder.duration) || 0
+                this.audioRecordingStartedAt = Date.now() - this.audioDuration * 1000
+                this.isAudioStarting = false
+                this.isAudioRecording = true
+                this.startAudioDurationTimer()
+            } catch (error) {
+                this.handleAudioRecordError(error)
+            }
+        },
+        toggleAudioRecording() {
+            if (!this.showAudio || this.isAudioStarting || this.isAudioSending || this.audioRecord) return
+
+            if (this.isAudioRecording) {
+                this.stopAudioRecording()
+                return
+            }
+
+            this.startAudioRecording()
+        },
+        handleAudioRecord(record) {
+            this.isAudioStarting = false
+            this.isAudioRecording = false
+            this.stopAudioDurationTimer()
+            // Ignore a recording that contains no captured audio frames.
+            if (!record || !record.blob || !record.blob.size || !record.duration) {
+                this.clearAudioRecord()
+                this.audioDialogVisible = false
+                return
+            }
+
+            this.audioRecord = record
+            this.audioRecordUrl = record.url || ''
+            this.audioDuration = record.duration
+            this.audioDialogVisible = true
+        },
+        stopAudioRecording() {
+            if (this.isAudioStarting) return
+            const recorder = this.audioRecorder
+            if (!recorder) return
+            try {
+                recorder.stop()
+            } catch (error) {
+                this.handleAudioRecordError(error)
+            }
+        },
+        startAudioDurationTimer() {
+            this.stopAudioDurationTimer()
+            this.audioDurationTimer = setInterval(() => {
+                if (!this.isAudioRecording) return
+                this.audioDuration = (Date.now() - this.audioRecordingStartedAt) / 1000
+            }, 200)
+        },
+        stopAudioDurationTimer() {
+            if (!this.audioDurationTimer) return
+            clearInterval(this.audioDurationTimer)
+            this.audioDurationTimer = null
+        },
+        formatAudioDuration(seconds) {
+            const duration = Math.max(0, Math.floor(Number(seconds) || 0))
+            const minutes = Math.floor(duration / 60)
+            const remainder = String(duration % 60).padStart(2, '0')
+            return `${minutes}:${remainder}`
+        },
+        cancelAudioRecording() {
+            if (this.isAudioSending) return
+            if (this.isAudioStarting || this.isAudioRecording) this.audioRecorder?.cancel?.()
+            this.stopAudioDurationTimer()
+            this.isAudioStarting = false
+            this.isAudioRecording = false
+            this.audioDialogVisible = false
+            this.clearAudioRecord()
+        },
+        reRecordAudio() {
+            if (this.isAudioStarting || this.isAudioSending || this.isAudioRecording) return
+
+            this.startAudioRecording()
+        },
+        async sendAudioRecording() {
+            if (!this.audioRecord || this.isAudioSending) return
+
+            this.isAudioSending = true
+            try {
+                const file = await this.persistAudioRecord(this.audioRecord)
+                const messageType = await ipc.getMessgeTypeSetting()
+                this.$emit('send-message', {
+                    content: '',
+                    files: [file],
+                    replyMessage: this.messageReply,
+                    messageType,
+                })
+                this.audioDialogVisible = false
+                this.clearAudioRecord()
+                this.resetMessage(true)
+            } catch (error) {
+                console.error('Failed to save recording:', error)
+                this.$message.error('录音保存失败，无法发送语音')
+            } finally {
+                this.isAudioSending = false
+            }
+        },
+        clearAudioRecord() {
+            const recordUrl = this.audioRecord?.url
+            const previewUrl = this.audioRecordUrl
+            const recorder = this.audioRecorder
+            this.resetAudioSession(this.audioPreviewSession)
+            this.audioRecord = null
+            this.audioRecordUrl = ''
+            if (recorder?.clearRecords) recorder.clearRecords()
+            else if (recordUrl) URL.revokeObjectURL(recordUrl)
+            if (previewUrl && previewUrl !== recordUrl) URL.revokeObjectURL(previewUrl)
+        },
+        handleAudioRecordError(error) {
+            if (error) console.error('Microphone access failed:', error)
+            this.stopAudioDurationTimer()
+            this.isAudioStarting = false
+            this.isAudioRecording = false
+            this.isAudioSending = false
+            this.audioDialogVisible = false
+            this.clearAudioRecord()
+            this.$message.error('无法访问麦克风，请检查麦克风权限')
+        },
+        handleAudioDialogClose() {
+            if (this.isAudioStarting || this.isAudioRecording) this.audioRecorder?.cancel?.()
+            this.stopAudioDurationTimer()
+            this.isAudioStarting = false
+            this.isAudioRecording = false
+            this.audioDialogVisible = false
+            this.clearAudioRecord()
+        },
+        async persistAudioRecord(record) {
+            const recordsDir = path.join(await ipc.getStorePath(), 'records')
+            await fs.promises.mkdir(recordsDir, { recursive: true })
+
+            const filename = `record-${Date.now()}.wav`
+            const filePath = path.join(recordsDir, filename)
+            const buffer = Buffer.from(await record.blob.arrayBuffer())
+            await fs.promises.writeFile(filePath, buffer)
+
+            return {
+                blob: record.blob,
+                name: filename,
+                size: buffer.length,
+                type: 'audio/wav',
+                extension: 'wav',
+                path: filePath,
+                localUrl: record.url,
+            }
+        },
+        disposeAudioRecorder() {
+            this.stopAudioDurationTimer()
+            this.audioDialogVisible = false
+            this.clearAudioRecord()
+
+            const recorder = this.audioRecorder
+            if (recorder) {
+                try {
+                    if (typeof recorder.dispose === 'function') {
+                        recorder.dispose()
+                    } else if (typeof recorder.cancel === 'function') {
+                        recorder.cancel()
+                    } else {
+                        recorder.stream?.getTracks().forEach((track) => track.stop())
+                        recorder.input?.disconnect()
+                        recorder.processor?.disconnect()
+                        recorder.context?.close()
+                    }
+                } catch (error) {
+                    console.warn('Failed to dispose audio recorder:', error)
+                }
+            }
+            this.audioRecorder = null
+            this.isAudioStarting = false
+            this.isAudioRecording = false
+            this.isAudioSending = false
+        },
+        getMessageText() {
+            return this.$refs.roomTextarea?.value || ''
+        },
+        persistMessageDraft() {
+            try {
+                if (this.pendingMessageDraft) localStorage.setItem(messageDraftStorageKey, this.pendingMessageDraft)
+                else localStorage.removeItem(messageDraftStorageKey)
+            } catch (error) {
+                console.warn('Failed to save message draft:', error)
+            }
+        },
+        saveMessageDraft(message, immediate = false) {
+            if (this.$route.name === 'history-page' || this.$route.name === 'member-history-page') return
+
+            this.pendingMessageDraft = message == null ? '' : String(message)
+            if (immediate) {
+                if (this.messageDraftSaveTimer) {
+                    clearTimeout(this.messageDraftSaveTimer)
+                    this.messageDraftSaveTimer = null
+                }
+                this.persistMessageDraft()
+                return
+            }
+
+            if (this.messageDraftSaveTimer) return
+            this.messageDraftSaveTimer = setTimeout(() => {
+                this.messageDraftSaveTimer = null
+                this.persistMessageDraft()
+            }, messageDraftThrottleMs)
+        },
+        restoreMessageDraft() {
+            if (this.$route.name === 'history-page' || this.$route.name === 'member-history-page') return
+
+            try {
+                const draft = localStorage.getItem(messageDraftStorageKey)
+                if (!draft || this.getMessageText()) return
+
+                this.setMessageText(draft, false)
+            } catch (error) {
+                console.warn('Failed to restore message draft:', error)
+            }
+        },
+        setMessageText(message, saveDraft = true) {
+            const textarea = this.$refs.roomTextarea
+            if (!textarea) return
+
+            textarea.value = message == null ? '' : String(message)
+            if (saveDraft) this.saveMessageDraft(textarea.value, !textarea.value)
+            this.updateMessageEmptyState(textarea.value)
+            this.scheduleTextareaResize()
+        },
+        scheduleTextareaResize() {
+            this.$nextTick(() => {
+                requestAnimationFrame(() => this.resizeTextarea())
+            })
+        },
+        appendMessageText(message) {
+            this.setMessageText(this.getMessageText() + message)
+        },
+        updateMessageEmptyState(message = this.getMessageText()) {
+            const isEmpty = !this.files.length && !message.trim()
+            if (isEmpty !== this.isMessageEmpty) this.isMessageEmpty = isEmpty
+        },
+        onTextareaKeydown(event) {
+            if (event.isComposing) return
+
+            if (event.key === 'Enter') {
+                this.onEnterKeydown(event)
+            } else if (event.key === 'ArrowUp') {
+                if (event.ctrlKey) {
+                    // Ctrl + ↑ 选择上一条消息进行回复
+                    event.preventDefault()
+                    this.moveReplySelection(-1)
+                } else if (!this.getMessageText()) {
+                    // 编辑重发上一条消息
+                    event.preventDefault()
+                    this.editLastOwnMessage()
+                }
+            } else if (event.key === 'ArrowDown' && event.ctrlKey) {
+                // Ctrl + ↓ 选择下一条消息进行回复
+                event.preventDefault()
+                this.moveReplySelection(1)
+            } else if (event.key === 'e' && event.ctrlKey) {
+                // 快捷表情选择
+                this.isQuickFaceOn = true
+                this.$nextTick(() => this.$refs.quickface.focus())
+            } else if (event.key === 'n' && event.ctrlKey && this.room.roomId < 0) {
+                // 快捷 at 选择
+                this.isQuickAtOn = true
+                this.$nextTick(() => this.$refs.quickat.focus())
+            }
+        },
+        onEnterKeydown(event) {
+            const shouldSend =
+                (keyToSendMessage === 'Enter' && !event.ctrlKey && !event.shiftKey) ||
+                (keyToSendMessage === 'CtrlEnter' && event.ctrlKey) ||
+                (keyToSendMessage === 'ShiftEnter' && !event.ctrlKey && event.shiftKey)
+
+            if (shouldSend) {
+                event.preventDefault()
+                this.sendMessage()
+                return
+            }
+
+            const shouldInsertLineBreak =
+                event.ctrlKey && (keyToSendMessage === 'Enter' || keyToSendMessage === 'ShiftEnter')
+            if (shouldInsertLineBreak) {
+                event.preventDefault()
+                this.useMessageContent('\n')
+                this.onChangeInput()
+            }
+        },
+        moveReplySelection(direction) {
+            if (direction > 0 && !this.messageReply) return
+
+            const messages = this.messages.filter((message) => !message.system && !message.flash)
+            if (!messages.length) return
+
+            if (!this.messageReply) {
+                // 如果当前没有回复消息，选择最后一条消息
+                this.messageReply = messages[messages.length - 1]
+            } else {
+                // 如果已经有回复消息，找到当前消息的位置，向前切换
+                const currentIndex = messages.findIndex((message) => message._id === this.messageReply._id)
+                if (currentIndex === -1) {
+                    if (direction < 0) {
+                        this.$nextTick(() => this.highlightMessage(this.messageReply._id))
+                    }
+                    this.focusTextarea()
+                    return
+                }
+
+                const nextIndex = currentIndex + direction
+                if (nextIndex >= 0 && nextIndex < messages.length) {
+                    this.messageReply = messages[nextIndex]
+                } else if (direction > 0 && currentIndex === messages.length - 1) {
+                    this.messageReply = null
+                }
+            }
+
+            if (this.messageReply) {
+                this.$nextTick(() => this.highlightMessage(this.messageReply._id))
+            }
+            this.focusTextarea()
+        },
+        editLastOwnMessage() {
+            const ownMessages = this.messages.filter((message) => message.senderId === this.currentUserId)
+            if (!ownMessages.length) return
+
+            const lastMessage = ownMessages[ownMessages.length - 1]
+            if (lastMessage.file && isImageFile(lastMessage.file)) {
+                this.onPasteGif(lastMessage.file.url)
+            } else if (lastMessage.file) {
+                return
+            }
+
+            this.messageReply = lastMessage.replyMessage
+            this.setMessageText(lastMessage.content)
+            this.$nextTick(() => {
+                const end = this.getMessageText().length
+                this.$refs.roomTextarea.setSelectionRange(end, end)
+            })
+            this.editAndResend = lastMessage._id
+        },
+        getAudioSession(message) {
+            if (!message || !message._id || !message.file || !isAudioFile(message.file)) return null
+            if (message.file.name === 'decoding' || message.file.url === 'decoding') return null
+            if (!this.audioSessions[message._id]) {
+                this.$set(this.audioSessions, message._id, {
+                    audio: new Audio(),
+                })
+            }
+            return this.audioSessions[message._id]
+        },
+        resetAudioSession(session) {
+            const audio = session?.audio
+            if (!audio) return
+            audio.pause()
+            audio.removeAttribute('src')
+            audio.load()
+        },
+        clearAudioSessions() {
+            Object.values(this.audioSessions).forEach((session) => this.resetAudioSession(session))
+            this.audioSessions = {}
+        },
         sendForward(target, name, multi = true, anonymous = false) {
             const isJSON = (str) => {
                 try {
@@ -1096,6 +1481,8 @@ export default {
                 }
                 if (msg) {
                     let content = msg.content
+                    const orderedParts = getOrderedMessageParts(msg)
+                    const forwardedImageIndexes = new Set()
                     singleMessage.user_id = msg.senderId
                     if (msg.replyMessage) {
                         singleMessage.message.push({
@@ -1106,48 +1493,67 @@ export default {
                             },
                         })
                     }
-                    if (content) {
-                        const icalinguaAtRegex = /<IcalinguaAt qq=\d+>([^<]*)<\/IcalinguaAt>/
-                        while (icalinguaAtRegex.test(content)) {
-                            const icalinguaAt = icalinguaAtRegex.exec(content)
-                            content = content.replace(icalinguaAt[0], decodeURIComponent(icalinguaAt[1]))
-                        }
+                    if (content || orderedParts) {
+                        const messageParts = orderedParts || [{ type: 'text', content }]
+                        for (const messagePart of messageParts) {
+                            if (messagePart.type === 'image') {
+                                const file = messagePart.file
+                                forwardedImageIndexes.add(messagePart.fileIndex)
+                                singleMessage.message.push({
+                                    type: 'image',
+                                    data: {
+                                        file: file.url.startsWith('data:image')
+                                            ? 'base64://' + file.url.replace(/^data:.+;base64,/, '')
+                                            : file.url,
+                                        type: 'image',
+                                    },
+                                })
+                                continue
+                            }
 
-                        const FACE_REGEX = /\[Face: (\d+)]/
-                        const Parts = []
-                        let splitContent = content
-                        while (FACE_REGEX.test(splitContent)) {
-                            const exec = FACE_REGEX.exec(splitContent)
-                            const index = exec.index
-                            const before = splitContent.substr(0, index)
-                            const text = exec[0]
-                            splitContent = splitContent.substr(index + text.length)
-                            before && Parts.push(before)
-                            Parts.push(text)
-                        }
-                        Parts.push(splitContent)
-                        for (const part of Parts) {
-                            const isFace = FACE_REGEX.test(part)
-                            if (isFace) {
-                                var temp = FACE_REGEX.exec(part)[1]
-                                singleMessage.message.push({
-                                    type: 'face',
-                                    data: {
-                                        id: Number.parseInt(temp, 10),
-                                    },
-                                })
-                            } else {
-                                singleMessage.message.push({
-                                    type: 'text',
-                                    data: {
-                                        text: part,
-                                    },
-                                })
+                            let partContent = messagePart.content
+                            const icalinguaAtRegex = /<IcalinguaAt qq=\d+>([^<]*)<\/IcalinguaAt>/
+                            while (icalinguaAtRegex.test(partContent)) {
+                                const icalinguaAt = icalinguaAtRegex.exec(partContent)
+                                partContent = partContent.replace(icalinguaAt[0], decodeURIComponent(icalinguaAt[1]))
+                            }
+
+                            const FACE_REGEX = /\[Face: (\d+)]/
+                            const parts = []
+                            while (FACE_REGEX.test(partContent)) {
+                                const exec = FACE_REGEX.exec(partContent)
+                                const index = exec.index
+                                const before = partContent.substr(0, index)
+                                const text = exec[0]
+                                partContent = partContent.substr(index + text.length)
+                                before && parts.push(before)
+                                parts.push(text)
+                            }
+                            parts.push(partContent)
+                            for (const part of parts) {
+                                const isFace = FACE_REGEX.test(part)
+                                if (isFace) {
+                                    const faceId = FACE_REGEX.exec(part)[1]
+                                    singleMessage.message.push({
+                                        type: 'face',
+                                        data: {
+                                            id: Number.parseInt(faceId, 10),
+                                        },
+                                    })
+                                } else if (part) {
+                                    singleMessage.message.push({
+                                        type: 'text',
+                                        data: {
+                                            text: part,
+                                        },
+                                    })
+                                }
                             }
                         }
                     }
                     if (msg.files) {
-                        msg.files.forEach((file) => {
+                        msg.files.forEach((file, fileIndex) => {
+                            if (forwardedImageIndexes.has(fileIndex)) return
                             if (file.type.startsWith('image/')) {
                                 singleMessage.message.push({
                                     type: 'image',
@@ -1378,7 +1784,10 @@ export default {
             // 消息未找到，尝试自动加载
             if (autoLoad && !isRetry) {
                 const maxRetries = 10
-                if (this.scrollingToReplyMessageRetryCount < maxRetries) {
+                if (
+                    this.scrollingToReplyMessageRetryCount < maxRetries &&
+                    !(this.$route.name === 'history-page' || this.$route.name === 'member-history-page')
+                ) {
                     this.scrollingToReplyMessageRetryCount++
                     const loadCount = 200 // 每次加载200条消息
                     console.log(
@@ -1428,12 +1837,12 @@ export default {
                 this.files = []
                 this.imageFiles = []
                 this.videoFiles = []
-                this.$refs.roomTextarea.message = ''
+                this.setMessageText('')
                 return
             }
 
             this.resetTextareaSize()
-            this.$refs.roomTextarea.message = ''
+            this.setMessageText('')
             this.editedMessage = {}
             this.messageReply = null
             this.files = []
@@ -1446,7 +1855,7 @@ export default {
             setTimeout(() => this.focusTextarea(disableMobileFocus), 0)
         },
         async paste() {
-            this.$refs.roomTextarea.message += await navigator.clipboard.readText()
+            this.appendMessageText(await navigator.clipboard.readText())
             const read = await navigator.clipboard.read()
             console.log(read)
             if (!read[0]) return
@@ -1485,26 +1894,24 @@ export default {
             el.scrollLeft += e.deltaY
         },
         resetTextareaSize() {
-            if (!this.$refs.roomTextarea.$refs.roomTextarea) return
-            this.$refs.roomTextarea.$refs.roomTextarea.style.height = '20px'
+            if (!this.$refs.roomTextarea) return
+            this.$refs.roomTextarea.style.height = '20px'
         },
         useMessageContent(content) {
-            const textarea = this.$refs.roomTextarea.$refs.roomTextarea
+            const textarea = this.$refs.roomTextarea
             const { selectionStart, selectionEnd } = textarea
-            this.$refs.roomTextarea.message =
-                this.$refs.roomTextarea.message.slice(0, selectionStart) +
-                content +
-                this.$refs.roomTextarea.message.slice(selectionEnd)
+            const message = this.getMessageText()
+            this.setMessageText(message.slice(0, selectionStart) + content + message.slice(selectionEnd))
             const newStart = selectionStart + content.length
             this.$nextTick(() => textarea.setSelectionRange(newStart, newStart))
         },
         focusTextarea(disableMobileFocus) {
             if (detectMobile() && disableMobileFocus) return
-            if (!this.$refs.roomTextarea.$refs.roomTextarea) return
-            this.$refs.roomTextarea.$refs.roomTextarea.focus()
+            if (!this.$refs.roomTextarea) return
+            this.$refs.roomTextarea.focus()
         },
         preventKeyboardFromClosing() {
-            if (this.keepKeyboardOpen) this.$refs.roomTextarea.$refs.roomTextarea.focus()
+            if (this.keepKeyboardOpen) this.focusTextarea()
         },
         closeQuickFace() {
             this.isQuickFaceOn = false
@@ -1525,8 +1932,9 @@ export default {
         useQuickAt(id, name) {
             this.isQuickAtOn = false
             if (typeof id === 'number') {
-                const atText = `@${name}`
-                if (id !== 0 && name !== '全体成员') {
+                const atName = name || String(id)
+                const atText = `@${atName}`
+                if (id !== 0 && atName !== '全体成员') {
                     ipc.pushAtCache({
                         text: atText,
                         id: id,
@@ -1537,7 +1945,7 @@ export default {
                         text: '@全体成员',
                     })
                 }
-                this.useMessageContent((this.useAtKey ? name : atText) + ' ')
+                this.useMessageContent((this.useAtKey ? atName : atText) + ' ')
             }
             this.useAtKey = false
             setTimeout(() => this.focusTextarea(), 0)
@@ -1550,8 +1958,8 @@ export default {
             setTimeout(() => this.focusTextarea(), 0)
         },
         async sendMessage() {
-            let message = this.$refs.roomTextarea.message
-            this.$refs.roomTextarea.message = ''
+            const message = this.getMessageText()
+            this.setMessageText('')
 
             if ((!this.files || !this.files.length) && !message) return
 
@@ -1584,7 +1992,7 @@ export default {
                 return false
             }
             const debugmode = await ipc.getDebugSetting()
-            let message = this.$refs.roomTextarea.message.trim()
+            const message = this.getMessageText().trim()
 
             if ((!this.files || !this.files.length) && !message) return
 
@@ -1651,6 +2059,29 @@ export default {
             this.messageReply = message
             this.focusTextarea()
         },
+        useMessageInlineCommand(message, inlineCommand) {
+            const senderId = Number(message.senderId)
+            const senderName = message.username || String(message.senderId)
+            const atText = `@${senderName}`
+            const command = inlineCommand.command.trimEnd()
+            if (!command) return
+
+            if (Number.isFinite(senderId)) {
+                ipc.pushAtCache({
+                    id: senderId,
+                    text: atText,
+                })
+            }
+            this.setMessageText(`${atText} ${command} `)
+            if (inlineCommand.reply) this.replyMessage(message)
+            else this.focusTextarea()
+
+            this.$nextTick(() => {
+                const textarea = this.$refs.roomTextarea
+                const end = this.getMessageText().length
+                textarea?.setSelectionRange(end, end)
+            })
+        },
         editMessage(message) {
             this.resetMessage()
             this.editedMessage = { ...message }
@@ -1667,7 +2098,7 @@ export default {
                 }
             }
 
-            this.$refs.roomTextarea.message = message.content
+            this.setMessageText(message.content)
         },
         getTopScroll(element) {
             const { scrollTop } = element
@@ -1719,15 +2150,18 @@ export default {
             }
             this.$emit('clear-last-unread-at')
         },
-        onChangeInput(e) {
+        onChangeInput(event) {
+            const message = event?.target?.value ?? this.getMessageText()
             this.keepKeyboardOpen = true
+            this.saveMessageDraft(message, !message)
+            this.updateMessageEmptyState(message)
             this.resizeTextarea()
-            this.$emit('typing-message', this.$refs.roomTextarea.message)
-            const selectionStart = this.$refs.roomTextarea.$refs.roomTextarea.selectionStart
+            this.$emit('typing-message', message)
+            const selectionStart = this.$refs.roomTextarea.selectionStart
             if (
                 this.room.roomId < 0 &&
-                this.$refs.roomTextarea.message.slice(selectionStart - 1, selectionStart) === '@' &&
-                !e.isComposing
+                message.slice(selectionStart - 1, selectionStart) === '@' &&
+                !event?.isComposing
             ) {
                 this.useAtKey = true
                 this.isQuickAtOn = true
@@ -1735,7 +2169,7 @@ export default {
             }
         },
         resizeTextarea() {
-            const el = this.$refs.roomTextarea.$refs.roomTextarea
+            const el = this.$refs.roomTextarea
 
             if (!el) return
 
@@ -1810,7 +2244,7 @@ export default {
                 } else {
                     this.resetMediaFile()
                     this.files = [fileObj]
-                    this.$refs.roomTextarea.message = file.name
+                    this.setMessageText(file.name)
                     break
                 }
             }
@@ -1848,7 +2282,7 @@ export default {
             this.$emit('open-file', { message, action, room: this.room })
         },
         textareaActionHandler() {
-            this.$emit('textarea-action-handler', this.$refs.roomTextarea.message)
+            this.$emit('textarea-action-handler', this.getMessageText())
         },
         msgctx(e, message) {
             const _message = Object.assign({}, message)
@@ -1969,6 +2403,18 @@ export default {
         textctx: ipc.popupTextAreaMenu,
         roomMenu(e) {
             ipc.popupRoomMenu(this.room.roomId, e)
+        },
+        openGroupAnnouncements() {
+            ipc.openGroupAnnouncements(this.room.roomId)
+        },
+        openGroupFiles() {
+            ipc.openGroupFiles(this.room.roomId)
+        },
+        openGroupAlbum() {
+            ipc.openGroupAlbum(this.room.roomId)
+        },
+        openGroupEssence() {
+            ipc.openGroupEssence(this.room.roomId)
         },
         stickersMenu(e) {
             ipc.popupStickerMenu(e, false)
@@ -2132,12 +2578,46 @@ export default {
     flex-flow: column;
 }
 
+.vac-empty-window-drag-region {
+    -webkit-app-region: drag;
+    user-select: none;
+}
+
 .vac-container-scroll {
     background: var(--chat-content-bg-color);
     flex: 1;
     overflow-y: auto;
     margin-top: 60px;
     -webkit-overflow-scrolling: touch;
+}
+
+.db-upgrade-banner {
+    position: sticky;
+    top: 0;
+    z-index: 5;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    min-height: 36px;
+    padding: 6px 12px;
+    color: var(--chat-message-color);
+    background: var(--chat-content-bg-color);
+    background: color-mix(in srgb, var(--chat-content-bg-color) 82%, transparent);
+    border-bottom: 1px solid var(--chat-message-divider-color, rgba(128, 128, 128, 0.25));
+
+    .el-icon-loading {
+        flex: 0 0 auto;
+    }
+
+    .db-upgrade-banner-message {
+        flex: 0 1 auto;
+        white-space: nowrap;
+    }
+
+    .el-progress {
+        flex: 1 1 auto;
+        min-width: 80px;
+    }
 }
 
 .vac-messages-container {
@@ -2269,6 +2749,82 @@ export default {
         white-space: nowrap;
         overflow: hidden;
         text-overflow: ellipsis;
+    }
+}
+
+.vac-record-button {
+    align-self: flex-end;
+    flex: 0 0 auto;
+}
+
+.vac-record-button svg {
+    width: 20px;
+}
+
+.vac-recording {
+    color: var(--chat-color-primary, #f56c6c);
+}
+
+.vac-recording svg {
+    fill: var(--chat-color-primary, #f56c6c) !important;
+}
+
+.vac-recording-pending {
+    pointer-events: none;
+    opacity: 0.6;
+}
+
+.vac-audio-dialog-body {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+}
+
+.vac-audio-dialog-status {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    min-height: 22px;
+    font-size: 14px;
+}
+
+.vac-audio-dialog-status strong {
+    margin-left: auto;
+    font-variant-numeric: tabular-nums;
+    font-weight: 600;
+}
+
+.vac-audio-dialog-hint {
+    margin: 0;
+    color: var(--panel-color-desc, #606266);
+    font-size: 13px;
+}
+
+.vac-audio-recording-dot {
+    display: inline-block;
+    width: 9px;
+    height: 9px;
+    flex: 0 0 9px;
+    border-radius: 50%;
+    background: #f56c6c;
+    box-shadow: 0 0 0 0 rgba(245, 108, 108, 0.45);
+    animation: vac-audio-recording-pulse 1.4s infinite;
+}
+
+.vac-audio-preview {
+    align-self: center;
+    width: 100%;
+    max-width: 300px;
+    margin: 2px 0 4px;
+}
+
+@keyframes vac-audio-recording-pulse {
+    0%,
+    100% {
+        box-shadow: 0 0 0 0 rgba(245, 108, 108, 0.45);
+    }
+    50% {
+        box-shadow: 0 0 0 5px rgba(245, 108, 108, 0);
     }
 }
 

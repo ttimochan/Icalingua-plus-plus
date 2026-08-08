@@ -60,13 +60,18 @@ import {
 import path from 'path'
 import { Socket } from 'socket.io'
 import { config, saveUserConfig, userConfig } from '../providers/configManager'
-import { broadcast } from '../providers/socketIoProvider'
+import { broadcast, broadcastDatabaseUpgradeProgress } from '../providers/socketIoProvider'
 import clients from '../utils/clients'
 import createRoom from '../utils/createRoom'
 import formatDate from '../utils/formatDate'
 import getImageUrlByMd5 from '../utils/getImageUrlByMd5'
 import getSysInfo from '../utils/getSysInfo'
-import createProcessMessage from '../utils/processMessage'
+import createProcessMessage, { registerSilkDecodeCompleter } from '../utils/processMessage'
+import {
+    getMediaPartIndex,
+    shiftMediaOrdersAfterTextReplacement,
+    splitContentByMediaOrder,
+} from '../utils/messageMediaOrder'
 import sleep from '../utils/sleep'
 import ChatGroup from '@icalingua/types/ChatGroup'
 import SpecialFeature from '@icalingua/types/SpecialFeature'
@@ -948,7 +953,13 @@ const initStorage = async () => {
             default:
                 break
         }
+        storage.onUpgradeProgress = (progress) => broadcastDatabaseUpgradeProgress(progress)
         await storage.connect()
+        registerSilkDecodeCompleter({
+            replaceMessage: (roomId, messageId, message) => storage.replaceMessage(roomId, messageId, message),
+            renewMessage: (roomId, messageId, message) => clients.renewMessage(roomId, messageId, message),
+            getMessage: (roomId, messageId) => storage.getMessage(roomId, messageId),
+        })
         storage.getAllRooms().then((e) => {
             e.forEach((e) => {
                 //更新群的名称
@@ -1044,6 +1055,8 @@ const processMessageRkey = async (message: Message): Promise<void> => {
 }
 
 const adapter = {
+    isMessageSearchIndexReady: () => storage?.isMessageSearchIndexReady?.() === true,
+    validateMessageSearchIndex: () => storage?.validateMessageSearchIndex?.() || Promise.resolve(),
     loggedIn: false,
     disabledFeatures: [] as SpecialFeature[],
     async getMsgNewURL(id: string, resolve): Promise<string> {
@@ -1103,7 +1116,8 @@ const adapter = {
         bot.setGroupLeave(gin)
     },
     setGroupBan(gin: number, uin: number, duration?: number): any {
-        bot.setGroupBan(gin, uin, duration)
+        if (uin === 0) bot.setGroupWholeBan(gin, duration > 0)
+        else bot.setGroupBan(gin, uin, duration)
     },
     setGroupAnonymousBan(gin: number, flag: string, duration?: number): any {
         bot.setGroupAnonymousBan(gin, flag, duration)
@@ -1299,6 +1313,42 @@ const adapter = {
         }
 
         const chain: MessageElem[] = []
+        const consumedMedia = new Set<number>()
+        const appendMedia = (index: number) => {
+            const img = media?.[index]
+            if (!img || consumedMedia.has(index)) return
+            const rawB64 = img.b64 ? img.b64.replace(/^data:.+;base64,/, '') : null
+            if (img.type?.startsWith('audio/') && img.fid) {
+                chain.push({
+                    type: 'record',
+                    data: { file: img.fid },
+                })
+            } else if (img.b64 && img.b64.startsWith('data:audio')) {
+                chain.push({
+                    type: 'record',
+                    data: { file: Buffer.from(rawB64, 'base64') },
+                })
+            } else if (img.b64) {
+                chain.push({
+                    type: 'image',
+                    data: {
+                        file: 'base64://' + rawB64,
+                        type: sticker ? 'face' : 'image',
+                        url: img.url || img.b64,
+                    },
+                })
+            } else if (img.url) {
+                chain.push({
+                    type: 'image',
+                    data: {
+                        file: img.url,
+                        type: sticker ? 'face' : 'image',
+                        url: img.url.replace(/\\/g, '/'),
+                    },
+                })
+            }
+            consumedMedia.add(index)
+        }
 
         if (messageType === 'anonymous') {
             if (roomId < 0)
@@ -1355,6 +1405,7 @@ const adapter = {
                         id: atQQ === 1 ? 'all' : atQQ,
                         text: name,
                     })
+                    shiftMediaOrdersAfterTextReplacement(media, icalinguaAt.index, icalinguaAt[0].length, name.length)
                     content = content.replace(icalinguaAt[0], name)
                 } catch (e) {
                     console.error(e)
@@ -1363,7 +1414,7 @@ const adapter = {
             }
             //这里是处理@人和表情 markup 的逻辑
             const FACE_REGEX = /\[Face: (\d+)]/
-            let splitContent = [content]
+            let splitContent = messageType === 'text' ? splitContentByMediaOrder(content, media || []) : [content]
             // 把 @xxx 的部分单独分割开
             // '喵@小A @小B呜' -> ['喵', '@小A', ' ', '@小B', '呜']
             for (const { text } of at) {
@@ -1403,6 +1454,11 @@ const adapter = {
             splitContent = newParts
             // 最后根据每个 string 元素判断类型并且换成对应的 MessageElem
             for (const part of splitContent) {
+                const mediaIndex = getMediaPartIndex(part)
+                if (mediaIndex !== null) {
+                    appendMedia(mediaIndex)
+                    continue
+                }
                 const atInfo = at.find((e) => e.text === part)
                 const isFace = FACE_REGEX.test(part)
                 let element: MessageElem
@@ -1492,35 +1548,7 @@ const adapter = {
             }
         }
         if (media && media.length) {
-            for (const img of media) {
-                const rawB64 = img.b64 ? img.b64.replace(/^data:.+;base64,/, '') : null
-                if (img.b64 && img.b64.startsWith('data:audio')) {
-                    chain.push({
-                        type: 'record',
-                        data: {
-                            file: Buffer.from(rawB64, 'base64'),
-                        },
-                    })
-                } else if (img.b64) {
-                    chain.push({
-                        type: 'image',
-                        data: {
-                            file: 'base64://' + rawB64,
-                            type: sticker ? 'face' : 'image',
-                            url: img.url || img.b64,
-                        },
-                    })
-                } else if (img.url) {
-                    chain.push({
-                        type: 'image',
-                        data: {
-                            file: img.url,
-                            type: sticker ? 'face' : 'image',
-                            url: img.url.replace(/\\/g, '/'),
-                        },
-                    })
-                }
-            }
+            media.forEach((_, index) => appendMedia(index))
         } else if (file) {
             chain.push({
                 type: 'image',

@@ -17,7 +17,6 @@ import { getConfig } from '../utils/configManager'
 import errorHandler from '../utils/errorHandler'
 import getFriends from '../utils/getFriends'
 import * as themes from '../utils/themes'
-import Message from '@icalingua/types/Message'
 import ChatGroup from '@icalingua/types/ChatGroup'
 import { spacingSendMessage } from '../../utils/panguSpacing'
 import silkEncode from '../utils/silkEncode'
@@ -25,6 +24,8 @@ import fs from 'fs'
 import ui from '../utils/ui'
 import { openChatWindow, isRoomInChatWindow, focusChatWindow } from '../utils/windowManager'
 import removeGroupNameEmotes from '../../utils/removeGroupNameEmotes'
+import { loadForwardMessages } from '../utils/forwardMessages'
+import type { ForwardResId } from '../utils/forwardMessages'
 
 let adapter: Adapter
 if (getConfig().adapter === 'oicq') adapter = oicqAdapter
@@ -56,6 +57,7 @@ export const {
     getFriendsFallback,
     clearCurrentRoomUnread,
     clearRoomUnread,
+    markRoomUnread,
     setRoomPriority,
     setRoomAutoDownload,
     setRoomAutoDownloadPath,
@@ -80,6 +82,13 @@ export const {
     sendGroupPoke,
     getPrivateFileUrl,
 } = adapter
+
+export const canValidateMessageSearchIndex = () => adapter?.isMessageSearchIndexReady?.() === true
+
+export const validateMessageSearchIndex = async () => {
+    await adapter?.validateMessageSearchIndex?.()
+}
+
 export const fetchLatestHistory = (roomId: number) => {
     let buffer: Buffer
     let uid = roomId
@@ -152,21 +161,27 @@ ipcMain.on('sendMessage', async (_, data) => {
     if (getConfig().sendSilkAudio) {
         if (data.file && data.file.type && data.file.type.startsWith('audio')) {
             const filepath = data.file.path
-            const fd = await fs.promises.open(filepath, 'r')
-            const head = (await fd.read(Buffer.alloc(7), 0, 7, 0)).buffer
-            fd.close()
-            if (!head.includes('SILK') && !head.includes('AMR')) {
-                ui.message('正在尝试编码高清语音...')
-                try {
-                    const silkFilePath = await silkEncode(data.file.path)
-                    const buffer = fs.readFileSync(silkFilePath)
-                    data.file.path = silkFilePath
-                    data.file.type = 'audio/silk'
-                    data.media = [{ b64: `data:audio;base64,${buffer.toString('base64')}` }]
-                    ui.messageSuccess('高清语音编码成功，正在发送...')
-                } catch (e) {
-                    console.error(e)
-                    ui.messageError('高清语音编码失败，将发送普通语音')
+            // Memory-backed recordings may not have a local path. Their media
+            // payload can still be sent, but they cannot be silk-encoded here.
+            if (filepath && fs.existsSync(filepath)) {
+                const fd = await fs.promises.open(filepath, 'r')
+                const head = Buffer.alloc(7)
+                await fd.read(head, 0, head.length, 0)
+                await fd.close()
+                const header = head.toString('ascii')
+                if (!header.includes('SILK') && !header.includes('AMR')) {
+                    ui.message('正在尝试编码高清语音...')
+                    try {
+                        const silkFilePath = await silkEncode(data.file.path)
+                        const buffer = fs.readFileSync(silkFilePath)
+                        data.file.path = silkFilePath
+                        data.file.type = 'audio/silk'
+                        data.media = [{ b64: `data:audio;base64,${buffer.toString('base64')}` }]
+                        ui.messageSuccess('高清语音编码成功，正在发送...')
+                    } catch (e) {
+                        console.error(e)
+                        ui.messageError('高清语音编码失败，将发送普通语音')
+                    }
                 }
             }
         }
@@ -220,6 +235,37 @@ ipcMain.handle(
     'searchMessages',
     async (_, { roomId, keyword, offset }: { roomId: number; keyword: string; offset: number }) => {
         const messages = await adapter.searchMessages(roomId, keyword, offset)
+        if (roomId === 0) {
+            const roomIds = Array.from(
+                new Set(
+                    messages
+                        .map((message) => message.roomId)
+                        .filter((messageRoomId): messageRoomId is number => messageRoomId !== undefined),
+                ),
+            )
+            const roomEntries = await Promise.all(
+                roomIds.map(async (messageRoomId) => {
+                    try {
+                        return [messageRoomId, await adapter.getRoom(messageRoomId)] as const
+                    } catch (e) {
+                        return [messageRoomId, null] as const
+                    }
+                }),
+            )
+            const rooms = new Map(roomEntries)
+            return messages.map((message) => {
+                if (message.roomId === undefined) return message
+                const room = rooms.get(message.roomId)
+                return {
+                    ...message,
+                    _roomName: room
+                        ? message.roomId < 0 && getConfig().removeGroupNameEmotes
+                            ? removeGroupNameEmotes(room.roomName)
+                            : room.roomName
+                        : `${message.roomId < 0 ? '群聊' : '私聊'} ${Math.abs(message.roomId)}`,
+                }
+            })
+        }
         return messages
     },
 )
@@ -230,6 +276,7 @@ ipcMain.on('openMemberHistory', async (_, senderId: number, roomId: number, send
     const win = newIcalinguaWindow({
         height: size.height - 200,
         width,
+        backgroundColor: themes.getThemeBackgroundColor(),
         autoHideMenuBar: true,
         webPreferences: {
             nodeIntegration: true,
@@ -258,7 +305,7 @@ ipcMain.on('updateMessage', (_, roomId: number, messageId: string, message: obje
 ipcMain.on('sendGroupPoke', (_, gin, uin) => adapter.sendGroupPoke(gin, uin))
 ipcMain.on('addRoom', (_, room) => adapter.addRoom(room))
 ipcMain.on('addChatGroup', (_, chatGroup) => adapter.addChatGroup(chatGroup))
-ipcMain.on('openForward', async (_, resId: string | any[], fileName?: string) => {
+ipcMain.on('openForward', (_, resId: ForwardResId, fileName?: string, fallbackResId?: string) => {
     const size = screen.getPrimaryDisplay().size
     let width = size.width - 300
     if (width > 1440) width = 900
@@ -266,6 +313,7 @@ ipcMain.on('openForward', async (_, resId: string | any[], fileName?: string) =>
         {
             height: size.height - 200,
             width,
+            backgroundColor: themes.getThemeBackgroundColor(),
             autoHideMenuBar: true,
             webPreferences: {
                 nodeIntegration: true,
@@ -273,15 +321,10 @@ ipcMain.on('openForward', async (_, resId: string | any[], fileName?: string) =>
                 contextIsolation: false,
             },
         },
-        { stableTitle: 'Icalingua++ ForwardView', deferShow: true },
+        { stableTitle: 'Icalingua++ ForwardView' },
     )
     win.loadURL(getWinUrl() + '#/history')
-    let messages: Promise<Message[]> | Message[]
-    if (Array.isArray(resId)) {
-        messages = resId
-    } else {
-        messages = adapter.getForwardMsg(resId, fileName)
-    }
+    const messages = loadForwardMessages(adapter, resId, fileName, fallbackResId)
     win.webContents.on('did-finish-load', async function () {
         // theme
         win.webContents.send('theme:sync-theme-data', themes.getThemeData())
@@ -293,9 +336,9 @@ ipcMain.on('openForward', async (_, resId: string | any[], fileName?: string) =>
             }
         })
         // load messages
-        if (messages instanceof Promise) messages = await messages
-        win.webContents.send('loadMessages', messages)
-        win.webContents.send('setResId', resId)
+        const loaded = await messages
+        win.webContents.send('loadMessages', loaded.messages)
+        win.webContents.send('setResId', loaded.resId)
     })
 })
 ipcMain.handle('getIgnoredChats', adapter.getIgnoredChats)

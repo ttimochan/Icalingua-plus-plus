@@ -403,8 +403,12 @@ var Q = ({ socket: t }) => {
         [s, d] = c.exports.useState(""),
         [F, v] = c.exports.useState([]),
         [V, x] = c.exports.useState([]),
+        [W, z] = c.exports.useState(""),
+        [selectedCount, setSelectedCount] = c.exports.useState(0),
+        selectedRowKeysRef = c.exports.useRef([]),
+        [selectionResetKey, setSelectionResetKey] = c.exports.useState(0),
         [f, B] = c.exports.useState(0),
-        E = [
+        E = c.exports.useMemo(() => [
             {
                 title: "名称",
                 dataIndex: "name",
@@ -449,7 +453,19 @@ var Q = ({ socket: t }) => {
                 },
                 sorter: (u, a) => u.create_time - a.create_time
             }
-        ];
+        ], []);
+    const Z = W.trim().toLocaleLowerCase(),
+        ee = c.exports.useMemo(() => (Z ? F.filter((u) => String(u.name || "").toLocaleLowerCase().includes(Z)) : F), [F, Z]),
+        rowSelection = c.exports.useMemo(
+            () => ({
+                onChange: (u) => {
+                    selectedRowKeysRef.current = u;
+                    setSelectedCount(u.length);
+                },
+                getCheckboxProps: (u) => ({ disabled: "is_dir" in u })
+            }),
+            []
+        );
     return (
         c.exports.useEffect(() => {
             r(!0),
@@ -459,29 +475,108 @@ var Q = ({ socket: t }) => {
                 });
         }, [n, f]),
         l("div", {
+            style: { height: "100%", display: "flex", flexDirection: "column", minWidth: 0 },
             children: [
-                l(p, {
-                    style: { padding: 10 },
+                l("div", {
+                    style: { display: "flex", alignItems: "center", gap: 10, padding: 10, flex: "0 0 auto" },
                     children: [
-                        i(p.Item, {
-                            children: i("a", { onClick: () => _("/", ""), children: "Root" })
+                        l(p, {
+                            style: { padding: 0, margin: 0, flex: 1 },
+                            children: [
+                                i(p.Item, {
+                                    children: i("a", { onClick: () => _("/", ""), children: "Root" })
+                                }),
+                                s && i(p.Item, { children: s })
+                            ]
                         }),
-                        s && i(p.Item, { children: s })
+                        i("button", {
+                            type: "button",
+                            disabled: selectedCount === 0,
+                            onClick: batchDownload,
+                            children: selectedCount ? `批量下载 (${selectedCount})` : "批量下载",
+                            style: {
+                                height: 32,
+                                padding: "0 12px",
+                                border: "1px solid #1890ff",
+                                borderRadius: 4,
+                                color: "#fff",
+                                backgroundColor: selectedCount ? "#1890ff" : "#d9d9d9",
+                                cursor: selectedCount ? "pointer" : "not-allowed"
+                            }
+                        }),
+                        i("input", {
+                            type: "search",
+                            value: W,
+                            placeholder: "搜索文件名",
+                            "aria-label": "搜索文件名",
+                            onChange: (u) => z(u.target.value),
+                            onKeyDown: (u) => u.key === "Escape" && z(""),
+                            style: {
+                                width: "min(280px, 40vw)",
+                                height: 32,
+                                padding: "4px 10px",
+                                border: "1px solid #d9d9d9",
+                                borderRadius: 4,
+                                outline: "none"
+                            }
+                        })
                     ]
                 }),
                 i(C, {
-                    dataSource: F,
+                    key: `${n}-${selectionResetKey}`,
+                    dataSource: ee,
                     columns: E,
                     loading: e,
                     rowKey: "fid",
-                    pagination: !1
+                    pagination: !1,
+                    locale: { emptyText: Z ? "未找到匹配的文件" : "暂无文件" },
+                    scroll: { y: "calc(100vh - 120px)" },
+                    rowSelection
                 })
             ]
         })
     );
     function _(u, a) {
         currentDir = a;
-        B(0), o(u), d(a);
+        B(0), o(u), d(a), z(""), (selectedRowKeysRef.current = []), setSelectedCount(0), setSelectionResetKey((m) => m + 1);
+    }
+    async function batchDownload() {
+        const files = selectedRowKeysRef.current
+            .map((u) => F.find((a) => a.fid === u))
+            .filter((u) => u && !("is_dir" in u));
+        if (!files.length) return;
+
+        let successCount = 0;
+        let failedCount = 0;
+        for (let m = 0; m < files.length; m++) {
+            const u = files[m];
+            try {
+                const result = await t.download(u.fid);
+                if (!result || result.url === "error") {
+                    failedCount++;
+                } else {
+                    window["download"] ? window["download"](result.url, result.name, undefined, false) : console.log("error", result);
+                    successCount++;
+                }
+            } catch (a) {
+                failedCount++;
+            }
+            if (m < files.length - 1) await new Promise((a) => setTimeout(a, 300));
+        }
+        selectedRowKeysRef.current = [];
+        setSelectedCount(0), setSelectionResetKey((m) => m + 1);
+        if (successCount) {
+            y.success({
+                message: "已发送下载任务",
+                description: `已发送 ${successCount} 个下载任务`
+            });
+        }
+        if (failedCount) {
+            y.error({
+                message: "部分文件下载失败",
+                description: `${failedCount} 个文件未能发送下载任务`
+            });
+        }
     }
     async function k(u, saveAs = false) {
         const a = await t.download(u);
@@ -627,7 +722,7 @@ function U() {
         i(L, {
             spinning: !e,
             children: l(g, {
-                style: { minHeight: "100vh" },
+                style: { minHeight: "100vh", height: "100vh", overflow: "hidden" },
                 children: [
                     i(g.Sider, {
                         style: { overflow: "auto", height: "100vh", left: 0, padding: 15 },
@@ -635,7 +730,7 @@ function U() {
                         children: e && i(G, { info: e.groupInfo })
                     }),
                     i(g.Content, {
-                        style: { overflow: "auto", height: "100vh", margin: "0 16px" },
+                        style: { overflow: "hidden", height: "100vh", margin: "0 16px", minWidth: 0 },
                         children: e && i(Q, { socket: e })
                     })
                 ]

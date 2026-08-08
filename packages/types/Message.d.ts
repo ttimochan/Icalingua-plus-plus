@@ -3,6 +3,11 @@ import MessageMirai from './MessageMirai'
 interface MessageFile {
     type: string
     url: string
+    /**
+     * UTF-16 offset in `Message.content` where this attachment appeared.
+     * Older messages omit it and keep the legacy media-before-text layout.
+     */
+    order?: number
     size?: number
     name?: string
     fid?: string
@@ -13,9 +18,15 @@ interface MessageFile {
 
 export default interface Message {
     _id: string | number
+    /** Present when a message is returned from a cross-room query. */
+    roomId?: number
+    /** Display metadata attached to cross-room query results. */
+    _roomName?: string
     senderId?: number
     username: string
     content: string
+    /** Render `content` using QQ Bot Markdown semantics. */
+    markdown?: boolean
     code?: string
     timestamp?: string
     date?: string

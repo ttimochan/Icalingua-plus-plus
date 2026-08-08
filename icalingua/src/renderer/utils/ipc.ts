@@ -10,6 +10,7 @@ import SearchableGroup from '@icalingua/types/SearchableGroup'
 import { ipcRenderer } from 'electron'
 import { FakeMessage, FriendInfo, GroupInfo, MemberInfo } from 'oicq-icalingua-plus-plus'
 import SpecialFeature from '@icalingua/types/SpecialFeature'
+import DatabaseUpgradeProgress from '@icalingua/types/DatabaseUpgradeProgress'
 
 const ipc = {
     sendMessage(data) {
@@ -89,6 +90,9 @@ const ipc = {
     async searchMessages(roomId: number, keyword: string, offset: number): Promise<Array<Message>> {
         return await ipcRenderer.invoke('searchMessages', { roomId, keyword, offset })
     },
+    openGlobalMessageSearch() {
+        ipcRenderer.send('openGlobalMessageSearch')
+    },
     openMemberHistory(senderId: number, roomId: number, senderName: string) {
         ipcRenderer.send('openMemberHistory', senderId, roomId, senderName)
     },
@@ -120,6 +124,9 @@ const ipc = {
     async getVersion(): Promise<string> {
         return await ipcRenderer.invoke('getVersion')
     },
+    async getDbUpgradeProgress(): Promise<DatabaseUpgradeProgress> {
+        return await ipcRenderer.invoke('getDbUpgradeProgress')
+    },
     download(url: string, out: string, dir?: string) {
         ipcRenderer.send('download', url, out, dir)
     },
@@ -132,6 +139,9 @@ const ipc = {
     cancelDownload(id: string) {
         ipcRenderer.send('cancelDownload', id)
     },
+    openDownloadedFile(filePath: string) {
+        ipcRenderer.send('openDownloadedFile', filePath)
+    },
     sendGroupPoke(gin: number, uin: number) {
         ipcRenderer.send('sendGroupPoke', gin, uin)
     },
@@ -143,6 +153,18 @@ const ipc = {
     },
     popupRoomMenu(roomId: number, e) {
         ipcRenderer.send('popupRoomMenu', roomId, { x: e.screenX, y: e.screenY })
+    },
+    openGroupAnnouncements(roomId: number) {
+        ipcRenderer.send('openGroupAnnouncements', roomId)
+    },
+    openGroupFiles(roomId: number) {
+        ipcRenderer.send('openGroupFiles', roomId)
+    },
+    openGroupAlbum(roomId: number) {
+        ipcRenderer.send('openGroupAlbum', roomId)
+    },
+    openGroupEssence(roomId: number) {
+        ipcRenderer.send('openGroupEssence', roomId)
     },
     popupAvatarMenu(message: Message, room: Room, e) {
         ipcRenderer.send('popupAvatarMenu', message, room, { x: e.screenX, y: e.screenY })
@@ -174,8 +196,8 @@ const ipc = {
     addChatGroup(chatGroup: ChatGroup) {
         ipcRenderer.send('addChatGroup', chatGroup)
     },
-    openForward(resId: string | any[], fileName?: string) {
-        ipcRenderer.send('openForward', resId, fileName)
+    openForward(resId: string | any[], fileName?: string, fallbackResId?: string) {
+        ipcRenderer.send('openForward', resId, fileName, fallbackResId)
     },
     makeForward(fakes: FakeMessage | Iterable<FakeMessage>, dm?: boolean, origin?: number, target?: number) {
         ipcRenderer.send('makeForward', fakes, dm, origin, target)

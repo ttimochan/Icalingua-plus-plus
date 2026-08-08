@@ -17,12 +17,20 @@ import { pushUnreadCount } from './socketIoSlave'
 import ui from './ui'
 import OnlineStatusType from '@icalingua/types/OnlineStatusType'
 import { setOnlineStatus, updateAppMenu } from '../ipc/menuManager'
-import { getMainWindow, isAppLocked, lockMainWindow, tryToShowMainWindow } from './windowManager'
+import {
+    getMainWindow,
+    isAppLocked,
+    lockMainWindow,
+    setMainWindowTitleBarHidden,
+    tryToShowMainWindow,
+} from './windowManager'
 import openImage from '../ipc/openImage'
 import removeGroupNameEmotes from '../../utils/removeGroupNameEmotes'
 import { spacingNotification } from '../../utils/panguSpacing'
 
 let tray: Tray
+let menuUpdatePromise: Promise<void> | null = null
+let menuUpdatePending = false
 
 let darknewmsgIcon = nativeImage.createFromPath(path.join(getStaticPath(), 'darknewmsg.png'))
 let newmsgIcon = nativeImage.createFromPath(path.join(getStaticPath(), 'newmsg.png'))
@@ -38,8 +46,30 @@ export const createTray = () => {
 }
 export const updateTrayMenu = async () => {
     if (!tray) return
+    if (menuUpdatePromise) {
+        menuUpdatePending = true
+        return menuUpdatePromise
+    }
+    do {
+        menuUpdatePending = false
+        menuUpdatePromise = _updateTrayMenu()
+        try {
+            await menuUpdatePromise
+        } finally {
+            menuUpdatePromise = null
+        }
+    } while (menuUpdatePending)
+}
+
+const _updateTrayMenu = async () => {
+    if (!tray) return
     tray.setToolTip(`Icalingua++: ${getNickname()} (${getUin()})\n通知优先级: ${getConfig().priority.toString()}`)
-    const unreadRooms: Room[] = await getUnreadRooms()
+    let unreadRooms: Room[]
+    try {
+        unreadRooms = await getUnreadRooms()
+    } catch {
+        unreadRooms = []
+    }
     const menu = Menu.buildFromTemplate([
         {
             label: `${getNickname()} (${getUin()})`,
@@ -150,14 +180,25 @@ export const updateTrayMenu = async () => {
     )
     menu.append(
         new MenuItem({
-            label: '显示菜单栏',
+            label: '隐藏菜单栏',
             type: 'checkbox',
-            checked: getConfig().showAppMenu,
+            checked: !getConfig().showAppMenu,
             click(item) {
-                getConfig().showAppMenu = item.checked
-                getMainWindow().setMenuBarVisibility(item.checked)
-                getMainWindow().setAutoHideMenuBar(!item.checked)
+                getConfig().showAppMenu = !item.checked
+                getMainWindow().setMenuBarVisibility(!item.checked)
+                getMainWindow().setAutoHideMenuBar(item.checked)
                 saveConfigFile()
+            },
+        }),
+    )
+    menu.append(
+        new MenuItem({
+            label: '隐藏标题栏',
+            type: 'checkbox',
+            checked: getConfig().hideTitleBar,
+            click: (item) => {
+                void setMainWindowTitleBarHidden(item.checked).catch(console.error)
+                updateAppMenu()
             },
         }),
     )

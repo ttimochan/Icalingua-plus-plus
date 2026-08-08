@@ -1,6 +1,6 @@
 {
     "name": "icalingua",
-    "version": "2.26.0",
+    "version": "2.26.3",
     "author": "The Icalingua++ Authors <Icalinguaplusplus@protonmail.com>",
     "description": "A client for (maybe) any IM made with Electron",
     "license": "AGPL-3.0",
@@ -9,18 +9,22 @@
     "homepage": "https://github.com/Icalingua-plus-plus/Icalingua-plus-plus",
     "scripts": {
         "deps:woa:sqlite3": "cd ../node_modules/sqlite3 && cross-env npm_config_arch=arm64 npx node-pre-gyp configure --target_arch=arm64 && cross-env npm_config_arch=arm64 npx node-pre-gyp build --target_arch=arm64",
-        "deps:mac:sqlite3": "cd ../node_modules/sqlite3 && cross-env npm_config_arch=arm64 npx node-pre-gyp configure --target_arch=arm64 && cross-env npm_config_arch=arm64 npx node-pre-gyp install --target_arch=arm64",
+        "deps:mac:sqlite3": "cd ../node_modules/sqlite3 && cross-env npm_config_arch=x64 npx node-pre-gyp install --target_arch=x64 && cross-env npm_config_arch=arm64 npx node-pre-gyp install --target_arch=arm64",
+        "deps:win32:sqlite3": "cd ../node_modules/sqlite3 && cross-env npm_config_arch=ia32 npx node-pre-gyp install --target_arch=ia32",
         "deps:woa": "npm run deps:woa:sqlite3",
         "deps:mac": "npm run deps:mac:sqlite3",
+        "deps:win32": "npm run deps:win32:sqlite3",
         "build": "ts-node .electron-vue/build.ts && electron-builder",
         "build:win": "electron-builder --win",
+        "build:win32": "cross-env npm_config_arch=ia32 electron-builder --win --ia32",
         "build:woa": "cross-env npm_config_arch=arm64 electron-builder --win --arm64",
         "build:arm": "electron-builder --arm",
         "build:electron": "electron-builder",
         "build:ci": "ts-node .electron-vue/build.ts",
         "build:dir": "ts-node .electron-vue/build.ts && electron-builder --dir",
         "build:clean": "cross-env BUILD_TARGET=clean ts-node .electron-vue/build.ts",
-        "dev": "cross-env NODE_ENV=development ts-node .electron-vue/dev-runner.ts"
+        "dev": "cross-env NODE_ENV=development ts-node .electron-vue/dev-runner.ts",
+        "test:message-formatting": "cross-env TS_NODE_PROJECT=tsconfig.json node --require ts-node/register/transpile-only --test src/renderer/components/vac-mod/utils/messageFormatting.test.ts src/renderer/components/vac-mod/utils/messageMarkdown.test.ts"
     },
     "build": {
         "productName": "Icalingua++",
@@ -40,7 +44,8 @@
         ],
         "nsis": {
             "oneClick": false,
-            "allowToChangeInstallationDirectory": true
+            "allowToChangeInstallationDirectory": true,
+            "include": "installer.nsh"
         },
         "linux": {
             "target": [
@@ -201,7 +206,7 @@
         "mongodb": "^4.17.2",
         "mysql": "^2.18.1",
         "nan": "^2.28.0",
-        "oicq-icalingua-plus-plus": "^1.26.10",
+        "oicq-icalingua-plus-plus": "^1.26.15",
         "pangu": "^4.0.7",
         "pg": "^8.22.0",
         "pg-query-stream": "^4.16.0",
@@ -226,7 +231,6 @@
         "@types/pangu": "^4.0.2",
         "@types/uuid": "^8.3.4",
         "ajv": "^6.15.0",
-        "aria2": "5.0.0",
         "axios": "^1.18.1",
         "cfonts": "^2.10.1",
         "chalk": "^4.1.2",

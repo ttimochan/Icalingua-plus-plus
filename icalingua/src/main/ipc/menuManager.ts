@@ -11,14 +11,13 @@ import getAvatarUrl from '../../utils/getAvatarUrl'
 import getImageUrlByMd5 from '../../utils/getImageUrlByMd5'
 import getStaticPath from '../../utils/getStaticPath'
 import getWinUrl from '../../utils/getWinUrl'
-import { newIcalinguaWindow, openMannounceWindow } from '../../utils/IcalinguaWindow'
-import socketIoProvider from '../providers/socketIoProvider'
+import createPlusOneMessage from '../../utils/createPlusOneMessage'
+import { newIcalinguaWindow } from '../../utils/IcalinguaWindow'
 import atCache from '../utils/atCache'
 import { getConfig, saveConfigFile } from '../utils/configManager'
 import exit from '../utils/exit'
 import exportContacts from '../utils/exportContacts'
 import exportGroupMembers from '../utils/exportGroupMembers'
-import gfsTokenManager from '../utils/gfsTokenManager'
 import isAdmin from '../utils/isAdmin'
 import openMedia from '../utils/openMedia'
 import setPriority from '../utils/setPriority'
@@ -49,11 +48,11 @@ import {
     hideMessage,
     ignoreChat,
     makeForward,
+    markRoomUnread,
     pinRoom,
     removeChat,
     renewMessage,
     renewMessageURL,
-    requestGfsToken,
     revealMessage,
     sendMessage,
     setOnlineStatus as setStatus,
@@ -64,6 +63,8 @@ import {
     sendGroupSign,
     getDisabledFeatures,
     sendGroupPoke,
+    canValidateMessageSearchIndex,
+    validateMessageSearchIndex,
 } from './botAndStorage'
 import { download, downloadFileByMessageData, downloadImage, getImageExt } from './downloadManager'
 import openImage from './openImage'
@@ -72,6 +73,7 @@ import removeGroupNameEmotes from '../../utils/removeGroupNameEmotes'
 import sleep from '../../utils/sleep'
 import { spacingSendMessage } from '../../utils/panguSpacing'
 import { pb } from 'oicq-icalingua-plus-plus'
+import { openGroupAlbum, openGroupAnnouncements, openGroupEssence, openGroupFiles } from '../utils/groupWebApps'
 
 const getStickersDir = () => path.join(app.getPath('userData'), 'stickers')
 let cachedStickerSubdirs: string[] | null = null
@@ -154,6 +156,7 @@ const openMemberHistoryWindow = (senderId: number, roomId: number, senderName: s
     const win = newIcalinguaWindow({
         height: size.height - 200,
         width,
+        backgroundColor: themes.getThemeBackgroundColor(),
         autoHideMenuBar: true,
         webPreferences: {
             nodeIntegration: true,
@@ -180,6 +183,7 @@ const openMessageSearchWindow = (roomId: number, roomName: string) => {
     const win = newIcalinguaWindow({
         height: size.height - 200,
         width,
+        backgroundColor: themes.getThemeBackgroundColor(),
         autoHideMenuBar: true,
         webPreferences: {
             nodeIntegration: true,
@@ -281,6 +285,10 @@ const buildRoomMenu = async (room: Room): Promise<Menu> => {
             click: () => pinRoom(room.roomId, !room.index),
         },
         {
+            label: '标记为未读',
+            click: () => markRoomUnread(room.roomId),
+        },
+        {
             label: '删除会话',
             click: () => removeChat(room.roomId),
         },
@@ -320,6 +328,7 @@ const buildRoomMenu = async (room: Room): Promise<Menu> => {
                 const win = newIcalinguaWindow({
                     height: size.height - 200,
                     width: 800,
+                    backgroundColor: themes.getThemeBackgroundColor(),
                     autoHideMenuBar: true,
                     webPreferences: {
                         nodeIntegration: true,
@@ -463,111 +472,19 @@ const buildRoomMenu = async (room: Room): Promise<Menu> => {
         webApps.append(
             new MenuItem({
                 label: '查看精华消息',
-                async click() {
-                    const size = screen.getPrimaryDisplay().size
-                    const win = newIcalinguaWindow({
-                        height: size.height - 200,
-                        width: 500,
-                        autoHideMenuBar: true,
-                        webPreferences: {
-                            preload: path.join(getStaticPath(), 'essenceInj.js'),
-                            contextIsolation: false,
-                        },
-                    })
-                    const cookies = await getCookies('qun.qq.com')
-                    for (const i in cookies) {
-                        await win.webContents.session.cookies.set({
-                            url: 'https://qun.qq.com',
-                            domain: '.qun.qq.com',
-                            name: i,
-                            value: cookies[i],
-                        })
-                    }
-                    await win.loadURL('https://qun.qq.com/essence/index?gc=' + -room.roomId)
-                },
+                click: () => openGroupEssence(room),
             }),
         )
         webApps.append(
             new MenuItem({
                 label: '群公告',
-                async click() {
-                    const size = screen.getPrimaryDisplay().size
-                    const win = newIcalinguaWindow({
-                        height: size.height - 200,
-                        width: 500,
-                        autoHideMenuBar: true,
-                        title: '群公告',
-                        webPreferences: {
-                            preload: path.join(getStaticPath(), 'mannouncePreload.js'),
-                            contextIsolation: false,
-                        },
-                    })
-                    const cookies = await getCookies('qun.qq.com')
-                    for (const i in cookies) {
-                        await win.webContents.session.cookies.set({
-                            url: 'https://web.qun.qq.com',
-                            domain: '.qun.qq.com',
-                            name: i,
-                            value: cookies[i],
-                        })
-                    }
-                    win.webContents.setWindowOpenHandler((details) => {
-                        if (details.url.startsWith('https://web.qun.qq.com/mannounce/')) {
-                            const win1 = openMannounceWindow(
-                                details.url.includes('detail') ? '查看群公告' : '发布新公告',
-                                250,
-                                details.url,
-                            )
-                            win1.on('closed', () => {
-                                if (win.isDestroyed()) return
-                                win.webContents.reload()
-                            })
-                        }
-                        return { action: 'deny' }
-                    })
-                    win.webContents.on('did-finish-load', () => {
-                        win.webContents.executeJavaScript(
-                            fs.readFileSync(path.join(getStaticPath(), 'mannounceInj.js'), 'utf-8'),
-                        )
-                    })
-                    await win.loadURL('https://web.qun.qq.com/mannounce/index.html#gc=' + -room.roomId)
-                },
+                click: () => openGroupAnnouncements(room),
             }),
         )
         webApps.append(
             new MenuItem({
                 label: '群文件',
-                async click() {
-                    const external = getConfig().externalGfsBrowser
-                    let url
-                    if (external) {
-                        url = external.replace('{groupId}', String(-room.roomId))
-                    } else if (getConfig().adapter === 'socketIo') {
-                        const token = await requestGfsToken(-room.roomId)
-                        url = `${getConfig().server}/file-manager/?${token}`
-                    } else {
-                        const token = gfsTokenManager.create(-room.roomId)
-                        url = `http://localhost:${socketIoProvider.getPort()}/file-manager/?${token}`
-                    }
-                    const size = screen.getPrimaryDisplay().size
-                    const win = newIcalinguaWindow({
-                        autoHideMenuBar: true,
-                        height: size.height - 200,
-                        width: 1500,
-                        webPreferences: {
-                            // 修复循环触发下载的问题
-                            partition: 'file-manager',
-                            preload: path.join(getStaticPath(), 'fileManagerPreload.js'),
-                            contextIsolation: false,
-                        },
-                    })
-                    win.webContents.session.on('will-download', (e, item) => {
-                        item.cancel()
-                        download(item.getURL(), item.getFilename())
-                    })
-                    win.loadURL(url)
-                    win.webContents.executeJavaScript('window.isAdmin = "' + (await isAdmin(room.roomId)) + '"')
-                },
+                click: () => openGroupFiles(room),
             }),
         )
         webApps.append(
@@ -596,39 +513,7 @@ const buildRoomMenu = async (room: Room): Promise<Menu> => {
         webApps.append(
             new MenuItem({
                 label: '群相册',
-                async click() {
-                    const size = screen.getPrimaryDisplay().size
-                    const win = newIcalinguaWindow({
-                        height: size.height - 200,
-                        width: 800,
-                        autoHideMenuBar: true,
-                    })
-                    const cookies = await getCookies('qzone.qq.com')
-                    for (const i in cookies) {
-                        await win.webContents.session.cookies.set({
-                            url: 'https://h5.qzone.qq.com',
-                            name: i,
-                            value: cookies[i],
-                        })
-                    }
-                    win.webContents.setWindowOpenHandler((details) => {
-                        const parsedUrl = new URL(details.url)
-                        if (parsedUrl.hostname === 'qungz.photo.store.qq.com') openImage(details.url)
-                        else if (parsedUrl.hostname === 'download.photo.qq.com') {
-                            const roomName = getConfig().removeGroupNameEmotes
-                                ? removeGroupNameEmotes(room.roomName)
-                                : room.roomName
-                            download(
-                                details.url,
-                                `${roomName}(${-room.roomId})的群相册_${new Date().getTime()}.zip`,
-                                undefined,
-                                true,
-                            )
-                        }
-                        return { action: 'deny' }
-                    })
-                    await win.loadURL('https://h5.qzone.qq.com/groupphoto/album?inqq=1&groupId=' + -room.roomId)
-                },
+                click: () => openGroupAlbum(room),
             }),
         )
         webApps.append(
@@ -753,6 +638,39 @@ const buildRoomMenu = async (room: Room): Promise<Menu> => {
                 label: '群成员',
                 async click() {
                     ui.openGroupMemberPanel(true, -room.roomId)
+                },
+            }),
+        )
+        menu.append(
+            new MenuItem({
+                label: '全员禁言',
+                visible: (await isAdmin(room.roomId)) !== false,
+                async click() {
+                    const win = newIcalinguaWindow({
+                        height: 210,
+                        width: 600,
+                        autoHideMenuBar: true,
+                        maximizable: false,
+                        modal: true,
+                        parent: getMainWindow(),
+                        webPreferences: {
+                            contextIsolation: false,
+                            nodeIntegration: true,
+                        },
+                    })
+                    const groupName = getConfig().removeGroupNameEmotes
+                        ? removeGroupNameEmotes(room.roomName)
+                        : room.roomName
+                    await win.loadURL(
+                        getWinUrl() +
+                            '#/muteUser/' +
+                            -room.roomId +
+                            '/0/' +
+                            querystring.escape(groupName) +
+                            '/' +
+                            querystring.escape('全体成员') +
+                            '/null',
+                    )
                 },
             }),
         )
@@ -1107,6 +1025,21 @@ export const updateAppMenu = async () => {
                         },
                     })
                     await win.loadURL(getWinUrl() + '#/openForward')
+                },
+            }),
+            new MenuItem({
+                label: '搜索全部聊天记录',
+                accelerator: 'CommandOrControl+Shift+F',
+                click: () => openMessageSearchWindow(0, '全部会话'),
+            }),
+            new MenuItem({
+                label: '校验消息搜索索引',
+                visible: canValidateMessageSearchIndex(),
+                click: async () => {
+                    const validation = validateMessageSearchIndex()
+                    await updateAppMenu()
+                    await validation
+                    await updateAppMenu()
                 },
             }),
             new MenuItem({
@@ -1471,6 +1404,16 @@ export const updateAppMenu = async () => {
                 },
             }),
             new MenuItem({
+                label: '压缩发送图片',
+                sublabel: 'JPG（75% 质量）',
+                type: 'checkbox',
+                checked: getConfig().compressImages === true,
+                click: (menuItem) => {
+                    getConfig().compressImages = menuItem.checked
+                    saveConfigFile()
+                },
+            }),
+            new MenuItem({
                 label: '启用插件',
                 type: 'checkbox',
                 checked: getConfig().custom === true,
@@ -1740,6 +1683,17 @@ export const updateAppMenu = async () => {
                         },
                     },
                     {
+                        label: '将 Bridge 数据同步到本地数据库',
+                        sublabel: '使用与本地模式相同的 SQLite 数据库',
+                        type: 'checkbox',
+                        checked: getConfig().bridgeLocalDatabaseSync,
+                        visible: getConfig().adapter === 'socketIo',
+                        click: (menuItem) => {
+                            getConfig().bridgeLocalDatabaseSync = menuItem.checked
+                            saveConfigFile()
+                        },
+                    },
+                    {
                         label: '静默获取历史消息',
                         sublabel: '隐藏刷屏的提示',
                         type: 'checkbox',
@@ -1922,6 +1876,11 @@ ipcMain.on('popupRoomMenu', async (event, roomId: number, e) => {
         ...pos,
     })
 })
+ipcMain.on('openGlobalMessageSearch', () => openMessageSearchWindow(0, '全部会话'))
+ipcMain.on('openGroupAnnouncements', async (_, roomId: number) => openGroupAnnouncements(await getRoom(roomId)))
+ipcMain.on('openGroupFiles', async (_, roomId: number) => openGroupFiles(await getRoom(roomId)))
+ipcMain.on('openGroupAlbum', async (_, roomId: number) => openGroupAlbum(await getRoom(roomId)))
+ipcMain.on('openGroupEssence', async (_, roomId: number) => openGroupEssence(await getRoom(roomId)))
 ipcMain.on('popupMessageMenu', async (event, e, room: Room, message: Message, sect?: string, history?: boolean) => {
     const win = getSenderWindow(event)
     const bounds = win.getContentBounds()
@@ -2432,28 +2391,22 @@ ipcMain.on('popupMessageMenu', async (event, e, room: Room, message: Message, se
                     },
                 }),
             )
-            if (!message.file || message.file.type.startsWith('image/')) {
+            const messageFileType = message.file?.type
+            if (
+                !message.markdown &&
+                (!messageFileType || messageFileType.startsWith('image/') || messageFileType.startsWith('audio/'))
+            ) {
                 menu.append(
                     new MenuItem({
                         label: `+1${message.code ? ' (普通消息)' : ''}`,
                         click: () => {
                             let messageType
                             if (getConfig().anonymous) messageType = 'anonymous'
-                            const msgToSend: any = {
-                                content: message.content,
-                                replyMessage: message.replyMessage,
-                                at: [],
+                            else if (message.code) messageType = 'text'
+                            const msgToSend = createPlusOneMessage(message, {
                                 roomId: room.roomId,
                                 messageType,
-                            }
-                            const imageUrls = message.files
-                                ? message.files.filter((f) => f.type && f.type.startsWith('image')).map((f) => f.url)
-                                : message.file
-                                  ? [message.file.url]
-                                  : []
-                            if (imageUrls.length) {
-                                msgToSend.media = imageUrls.map((url) => ({ url }))
-                            }
+                            })
                             sendMessage(msgToSend)
                         },
                     }),
@@ -2743,13 +2696,16 @@ ipcMain.on('popupAvatarMenu', async (event, message: Message, room: Room, ev) =>
                 label: '@ TA',
                 click() {
                     atCache.push({
-                        text: '@' + message.username,
+                        text: '@' + (message.username || String(message.senderId)),
                         id: message.senderId,
                     })
                     if (win !== getMainWindow()) {
-                        win.webContents.send('addMessageText', '@' + message.username + ' ')
+                        win.webContents.send(
+                            'addMessageText',
+                            '@' + (message.username || String(message.senderId)) + ' ',
+                        )
                     } else {
-                        ui.addMessageText('@' + message.username + ' ')
+                        ui.addMessageText('@' + (message.username || String(message.senderId)) + ' ')
                     }
                 },
             }),
@@ -2888,7 +2844,7 @@ ipcMain.on('popupAvatarMenu', async (event, message: Message, room: Room, ev) =>
                                     : room.roomName,
                             ) +
                             '/' +
-                            querystring.escape(message.username) +
+                            querystring.escape(message.username || String(message.senderId)) +
                             '/' +
                             querystring.escape(message.anonymousflag),
                     )
@@ -2925,7 +2881,7 @@ ipcMain.on('popupAvatarMenu', async (event, message: Message, room: Room, ev) =>
                                     : room.roomName,
                             ) +
                             '/' +
-                            querystring.escape(message.username),
+                            querystring.escape(message.username || String(message.senderId)),
                     )
                 },
             }),
@@ -3206,10 +3162,10 @@ ipcMain.on(
                     label: '@ TA',
                     click: async () => {
                         atCache.push({
-                            text: '@' + remark,
+                            text: '@' + (remark || String(displayId)),
                             id: displayId,
                         })
-                        ui.addMessageText('@' + remark + ' ')
+                        ui.addMessageText('@' + (remark || String(displayId)) + ' ')
                         ui.openGroupMemberPanel(false)
                     },
                 }),
@@ -3254,7 +3210,7 @@ ipcMain.on(
                                         : selectedRoom.roomName,
                                 ) +
                                 '/' +
-                                querystring.escape(remark) +
+                                querystring.escape(remark || String(displayId)) +
                                 '/' +
                                 'null',
                         )
@@ -3291,7 +3247,7 @@ ipcMain.on(
                                         : selectedRoom.roomName,
                                 ) +
                                 '/' +
-                                querystring.escape(remark),
+                                querystring.escape(remark || String(displayId)),
                         )
                     },
                 }),

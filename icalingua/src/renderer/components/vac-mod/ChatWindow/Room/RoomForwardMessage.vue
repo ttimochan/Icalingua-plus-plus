@@ -58,6 +58,7 @@
 <script>
 import SvgIcon from '../../components/SvgIcon'
 import ipc from '../../../../utils/ipc'
+import createPlusOneMessage from '../../../../../utils/createPlusOneMessage'
 export default {
     name: 'RoomForwardMessage',
     components: {
@@ -119,21 +120,15 @@ export default {
             let count = 0
             for (const msg of this.messages) {
                 if (msgsToForward.includes(msg._id)) {
-                    if (!msg.flash && (!msg.file || msg.file.type.startsWith('image/'))) {
-                        const msgToSend = {
-                            content: msg.content,
-                            replyMessage: msg.replyMessage,
-                            at: [],
+                    const type = msg.file?.type
+                    if (
+                        !msg.flash &&
+                        !msg.markdown &&
+                        (!type || type.startsWith('image/') || type.startsWith('audio/'))
+                    ) {
+                        const msgToSend = createPlusOneMessage(msg, {
                             roomId: this.roomId,
-                        }
-                        const imageUrls = msg.files
-                            ? msg.files.filter((f) => f.type && f.type.startsWith('image')).map((f) => f.url)
-                            : msg.file
-                              ? [msg.file.url]
-                              : []
-                        if (imageUrls.length) {
-                            msgToSend.media = imageUrls.map((url) => ({ url }))
-                        }
+                        })
                         ipc.sendMessage(msgToSend)
                         count++
                         if (count < msgsToForward.length) {
@@ -163,6 +158,16 @@ export default {
         border-radius: 4px;
         padding: 8px 10px;
         display: flex;
+        flex-wrap: wrap;
+        gap: 8px;
+
+        .el-button {
+            margin-left: 0;
+        }
+
+        .el-button + .el-button {
+            margin-left: 0;
+        }
     }
 
     .vac-forward-info {
@@ -203,12 +208,21 @@ export default {
         padding: 5px 8px;
         width: calc(100% - 16px);
     }
+
+    .vac-forward-box {
+        padding: 6px 8px;
+        gap: 6px;
+
+        .el-button {
+            padding: 8px 10px;
+        }
+    }
 }
 
 .vac-selected-counter {
     position: absolute;
     align-items: center;
-    bottom: 80px;
+    bottom: calc(100% + 14px);
     right: 20px;
     padding: 8px;
     background: var(--chat-footer-bg-color);

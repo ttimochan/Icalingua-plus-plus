@@ -65,6 +65,7 @@
                             'vac-message-highlight': isMessageHover,
                             'vac-message-current': message.senderId === currentUserId,
                             'vac-message-deleted': message.deleted || message.hide,
+                            'vac-message-markdown': message.markdown,
                             'vac-message-clickable': showForwardPanel,
                             'vac-message-selected': selected,
                         }"
@@ -81,7 +82,8 @@
                             }"
                             style="display: flex"
                         >
-                            <span style="width: 100%">{{ message.username }}</span>
+                            <span style="width: 100%">{{ message.username || message.senderId }}</span>
+                            <span v-if="message.markdown" class="vac-text-markdown-badge">Markdown</span>
                             <span
                                 v-show="
                                     message.role &&
@@ -103,7 +105,6 @@
                         <message-reply
                             v-if="((!message.deleted && !message.hide) || message.reveal) && message.replyMessage"
                             :message="message"
-                            :room-users="roomUsers"
                             :linkify="linkify"
                             :showForwardPanel="showForwardPanel"
                             :forward-res-id="forwardResId"
@@ -128,6 +129,56 @@
                             <span>{{ textMessages.MESSAGE_HIDE }}</span>
                         </div>
 
+                        <message-markdown
+                            v-else-if="message.markdown"
+                            :content="message.content"
+                            :hide-chat-image-by-default="hideChatImageByDefault"
+                            :local-image-viewer-by-default="localImageViewerByDefault"
+                            :show-forward-panel="showForwardPanel"
+                            @inline-command="$emit('inline-command', $event)"
+                        />
+
+                        <template v-else-if="orderedMessageParts">
+                            <div v-for="part in orderedMessageParts" :key="part.key" class="vac-ordered-message-part">
+                                <message-image
+                                    v-if="part.type === 'image'"
+                                    :current-user-id="currentUserId"
+                                    :file="part.file"
+                                    :flash="message.flash"
+                                    :content="message.content"
+                                    :text-formatting="textFormatting"
+                                    :image-hover="imageHover"
+                                    :showForwardPanel="showForwardPanel"
+                                    :hide-chat-image-by-default="hideChatImageByDefault"
+                                    :local-image-viewer-by-default="localImageViewerByDefault"
+                                    :messages="messages"
+                                    :message="message"
+                                    :img_index="part.fileIndex"
+                                    @open-file="openFile"
+                                >
+                                    <template v-for="(i, name) in $scopedSlots" #[name]="data">
+                                        <slot :name="name" v-bind="data" />
+                                    </template>
+                                </message-image>
+                                <format-message
+                                    v-else
+                                    :content="part.content"
+                                    :text-formatting="textFormatting"
+                                    :linkify="linkify"
+                                    :showForwardPanel="showForwardPanel"
+                                    :forward-res-id="forwardResId"
+                                    :code="message.code"
+                                    :disableQLottie="disableQLottie"
+                                    :usePanguJs="usePanguJs"
+                                    @open-forward="$emit('open-forward', $event)"
+                                >
+                                    <template #deleted-icon="data">
+                                        <slot name="deleted-icon" v-bind="data" />
+                                    </template>
+                                </format-message>
+                            </div>
+                        </template>
+
                         <template v-else-if="isImage && message.files">
                             <message-image
                                 v-for="(file, i) in message.files"
@@ -136,7 +187,6 @@
                                 :file="file"
                                 :flash="message.flash"
                                 :content="message.content"
-                                :room-users="roomUsers"
                                 :text-formatting="textFormatting"
                                 :image-hover="imageHover"
                                 :showForwardPanel="showForwardPanel"
@@ -159,7 +209,6 @@
                             :file="message.file"
                             :flash="message.flash"
                             :content="message.content"
-                            :room-users="roomUsers"
                             :text-formatting="textFormatting"
                             :image-hover="imageHover"
                             :showForwardPanel="showForwardPanel"
@@ -182,11 +231,32 @@
                         ></message-video>
 
                         <div v-else-if="isAudio" class="vac-audio-message">
-                            <div id="vac-audio-player">
-                                <audio controls controlslist="nodownload noremoteplayback novolume nomute">
-                                    <source :src="audioPath" />
-                                </audio>
+                            <div v-if="isAudioDecoding" class="vac-audio-decoding" title="语音解码中">
+                                <div class="vac-audio-decoding-icon" aria-hidden="true">
+                                    <svg viewBox="0 0 24 24" width="18" height="18">
+                                        <path
+                                            fill="currentColor"
+                                            d="M12 3a3 3 0 0 0-3 3v6a3 3 0 0 0 6 0V6a3 3 0 0 0-3-3zm-7 8a1 1 0 0 1 2 0 5 5 0 0 0 10 0 1 1 0 1 1 2 0 7 7 0 0 1-6 6.93V20h2a1 1 0 1 1 0 2H9a1 1 0 1 1 0-2h2v-2.07A7 7 0 0 1 5 11z"
+                                        />
+                                    </svg>
+                                </div>
+                                <div class="vac-audio-decoding-wave" aria-hidden="true">
+                                    <span></span>
+                                    <span></span>
+                                    <span></span>
+                                    <span></span>
+                                    <span></span>
+                                </div>
+                                <div class="vac-audio-decoding-text">
+                                    <span class="vac-audio-decoding-title">语音解码中</span>
+                                    <span class="vac-audio-decoding-dots">
+                                        <i></i>
+                                        <i></i>
+                                        <i></i>
+                                    </span>
+                                </div>
                             </div>
+                            <message-audio v-else :src="audioPath" :audio-session="audioSession" />
                         </div>
 
                         <div v-else-if="message.file" class="vac-file-message">
@@ -209,10 +279,11 @@
                         <format-message
                             v-if="
                                 ((!message.deleted && !message.hide) || message.reveal) &&
+                                !message.markdown &&
+                                !orderedMessageParts &&
                                 !(lottie && message.content.startsWith('[QLottie') && !disableQLottie)
                             "
                             :content="message.content"
-                            :users="roomUsers"
                             :text-formatting="textFormatting"
                             :linkify="linkify"
                             :showForwardPanel="showForwardPanel"
@@ -267,6 +338,8 @@ import FormatMessage from '../../components/FormatMessage'
 import MessageReply from './MessageReply'
 import MessageImage from './MessageImage'
 import MessageVideo from './MessageVideo'
+import MessageAudio from './MessageAudio'
+import MessageMarkdown from './MessageMarkdown'
 
 import getLottieFace from '../../../../utils/getLottieFace'
 
@@ -278,6 +351,8 @@ import ipc from '../../../../utils/ipc'
 import getImageUrlByMd5 from '../../../../../utils/getImageUrlByMd5'
 import getAvatarUrl from '../../../../../utils/getAvatarUrl'
 import pangu from 'pangu'
+import { getOrderedMessageParts } from '../../utils/messageMediaOrder'
+import createPlusOneMessage from '../../../../../utils/createPlusOneMessage'
 
 export default {
     name: 'Message',
@@ -286,7 +361,9 @@ export default {
         FormatMessage,
         MessageReply,
         MessageImage,
+        MessageAudio,
         MessageVideo,
+        MessageMarkdown,
         LottieAnimation,
     },
 
@@ -296,6 +373,7 @@ export default {
         index: { type: Number, required: true },
         message: { type: Object, required: true },
         messages: { type: Array, required: true },
+        audioSession: { type: Object, default: null },
         editedMessage: { type: Object, required: true },
         roomUsers: { type: Array, default: () => [] },
         roomFooterRef: { type: HTMLDivElement, default: null },
@@ -351,13 +429,24 @@ export default {
         isImage() {
             return isImageFile(this.message.file)
         },
+        orderedMessageParts() {
+            return getOrderedMessageParts(this.message)
+        },
         isVideo() {
             return this.checkVideoType(this.message.file)
         },
         isAudio() {
             return this.checkAudioType(this.message.file)
         },
+        isAudioDecoding() {
+            return (
+                this.isAudio &&
+                this.message.file &&
+                (this.message.file.name === 'decoding' || this.message.file.url === 'decoding')
+            )
+        },
         audioPath() {
+            if (this.isAudioDecoding) return ''
             if (this.message.file.url === this.message.file.name) {
                 return this.recordPath + '/' + this.message.file.name
             }
@@ -408,8 +497,13 @@ export default {
             }
         },
         canPlusOne() {
-            // +1 功能只在消息没有文件或文件是图片时可用
-            return !this.message.flash && (!this.message.file || this.message.file.type.startsWith('image/'))
+            // +1 功能支持普通消息、图片和可复用协议资源的语音
+            const type = this.message.file?.type
+            return (
+                !this.message.markdown &&
+                !this.message.flash &&
+                (!type || type.startsWith('image/') || type.startsWith('audio/'))
+            )
         },
     },
 
@@ -514,20 +608,7 @@ export default {
             new Audio(`file://${__static}/action_menu_select.wav`).play()
         },
         plusOne() {
-            const msgToSend = {
-                content: this.message.content,
-                replyMessage: this.message.replyMessage,
-                at: [],
-            }
-            const imageUrls = this.message.files
-                ? this.message.files.filter((f) => f.type && f.type.startsWith('image')).map((f) => f.url)
-                : this.message.file
-                  ? [this.message.file.url]
-                  : []
-            if (imageUrls.length) {
-                msgToSend.media = imageUrls.map((url) => ({ url }))
-            }
-            ipc.sendMessage(msgToSend)
+            ipc.sendMessage(createPlusOneMessage(this.message))
             new Audio(`file://${__static}/action_menu_select.wav`).play()
         },
     },
@@ -661,6 +742,11 @@ export default {
     background: var(--chat-message-bg-color-me) !important;
 }
 
+.vac-message-markdown {
+    padding: 6px 9px 3px;
+    border-radius: 8px;
+}
+
 .vac-message-deleted {
     color: var(--chat-message-color-deleted) !important;
     font-size: 13px !important;
@@ -733,25 +819,160 @@ export default {
     text-align: right;
 }
 
-.selector:not(*:root),
-#vac-audio-player {
-    max-width: 300px;
-    overflow: hidden;
-    border-top-right-radius: 1em;
-    border-bottom-right-radius: 2.5em 1em;
-
-    audio {
-        height: 40px;
-        max-width: 100%;
-
-        &::-webkit-media-controls-panel {
-            height: 40px;
-        }
-    }
+.vac-text-markdown-badge {
+    display: inline-block;
+    margin-left: 6px;
+    padding: 0 4px;
+    border: 1px solid color-mix(in srgb, currentColor 40%, transparent);
+    border-radius: 3px;
+    font-size: 12px;
+    line-height: 1.4;
+    opacity: 0.85;
+    vertical-align: middle;
 }
 
 .vac-audio-message {
     margin-top: 3px;
+}
+
+.vac-audio-decoding {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    min-width: 180px;
+    max-width: 300px;
+    height: 40px;
+    padding: 0 12px 0 10px;
+    box-sizing: border-box;
+    border-radius: 20px;
+    background: var(--chat-message-bg-color-media, rgba(0, 0, 0, 0.06));
+    color: var(--chat-message-color, inherit);
+    user-select: none;
+}
+
+.vac-audio-decoding-icon {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 28px;
+    height: 28px;
+    border-radius: 50%;
+    flex-shrink: 0;
+    background: rgba(25, 118, 210, 0.12);
+    color: #1976d2;
+    animation: vac-audio-decoding-pulse 1.6s ease-in-out infinite;
+}
+
+.vac-audio-decoding-wave {
+    display: flex;
+    align-items: center;
+    gap: 3px;
+    height: 18px;
+    flex-shrink: 0;
+
+    span {
+        display: block;
+        width: 3px;
+        height: 100%;
+        border-radius: 2px;
+        background: currentColor;
+        opacity: 0.55;
+        transform-origin: center;
+        animation: vac-audio-decoding-bar 1s ease-in-out infinite;
+
+        &:nth-child(1) {
+            animation-delay: 0s;
+        }
+        &:nth-child(2) {
+            animation-delay: 0.12s;
+        }
+        &:nth-child(3) {
+            animation-delay: 0.24s;
+        }
+        &:nth-child(4) {
+            animation-delay: 0.36s;
+        }
+        &:nth-child(5) {
+            animation-delay: 0.48s;
+        }
+    }
+}
+
+.vac-audio-decoding-text {
+    display: flex;
+    align-items: center;
+    gap: 2px;
+    min-width: 0;
+    font-size: 12px;
+    line-height: 1;
+    opacity: 0.85;
+}
+
+.vac-audio-decoding-title {
+    white-space: nowrap;
+}
+
+.vac-audio-decoding-dots {
+    display: inline-flex;
+    align-items: center;
+    gap: 2px;
+    margin-left: 2px;
+
+    i {
+        width: 3px;
+        height: 3px;
+        border-radius: 50%;
+        background: currentColor;
+        opacity: 0.35;
+        animation: vac-audio-decoding-dot 1.2s ease-in-out infinite;
+
+        &:nth-child(1) {
+            animation-delay: 0s;
+        }
+        &:nth-child(2) {
+            animation-delay: 0.2s;
+        }
+        &:nth-child(3) {
+            animation-delay: 0.4s;
+        }
+    }
+}
+
+@keyframes vac-audio-decoding-bar {
+    0%,
+    100% {
+        transform: scaleY(0.35);
+        opacity: 0.35;
+    }
+    50% {
+        transform: scaleY(1);
+        opacity: 0.9;
+    }
+}
+
+@keyframes vac-audio-decoding-dot {
+    0%,
+    80%,
+    100% {
+        opacity: 0.25;
+        transform: translateY(0);
+    }
+    40% {
+        opacity: 1;
+        transform: translateY(-1px);
+    }
+}
+
+@keyframes vac-audio-decoding-pulse {
+    0%,
+    100% {
+        transform: scale(1);
+        box-shadow: 0 0 0 0 rgba(25, 118, 210, 0.18);
+    }
+    50% {
+        transform: scale(1.04);
+        box-shadow: 0 0 0 4px rgba(25, 118, 210, 0);
+    }
 }
 
 .vac-file-message {

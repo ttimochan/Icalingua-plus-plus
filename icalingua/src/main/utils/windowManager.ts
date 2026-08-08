@@ -1,6 +1,6 @@
 import { BrowserWindow, globalShortcut, nativeTheme, shell, screen, ipcMain, Menu, MenuItem } from 'electron'
 import { clearCurrentRoomUnread, getCookies, sendOnlineData } from '../ipc/botAndStorage'
-import { getConfig, saveConfigFile } from './configManager'
+import { getConfig, saveConfigFile, MAIN_WINDOW_MIN_SIZE } from './configManager'
 import getWinUrl from '../../utils/getWinUrl'
 import { updateTrayIcon, updateTrayMenu } from './trayManager'
 import path from 'path'
@@ -12,6 +12,7 @@ import md5 from 'md5'
 import crypto from 'crypto'
 import atCache from './atCache'
 import * as themes from './themes'
+import DatabaseUpgradeProgress from '@icalingua/types/DatabaseUpgradeProgress'
 
 let loginWindow: BrowserWindow
 let mainWindow: BrowserWindow
@@ -20,6 +21,24 @@ let deviceManagerWindow: BrowserWindow
 let unlockWindow: BrowserWindow
 let isLocked: boolean = false
 let unlockCallback: Function
+let titleBarUpdatePromise: Promise<void> | null = null
+type DatabaseUpgradeProgressSource = 'local' | 'bridge'
+
+const emptyDatabaseUpgradeProgress = (): DatabaseUpgradeProgress => ({
+    active: false,
+    step: 0,
+    total: 0,
+    message: '',
+})
+const databaseUpgradeProgressBySource: Record<
+    DatabaseUpgradeProgressSource,
+    { progress: DatabaseUpgradeProgress; sequence: number }
+> = {
+    local: { progress: emptyDatabaseUpgradeProgress(), sequence: 0 },
+    bridge: { progress: emptyDatabaseUpgradeProgress(), sequence: 0 },
+}
+let databaseUpgradeProgress = emptyDatabaseUpgradeProgress()
+let databaseUpgradeProgressSequence = 0
 
 // 独立聊天窗口映射表 (roomId -> BrowserWindow)
 const chatWindows: Map<number, BrowserWindow> = new Map()
@@ -38,23 +57,18 @@ async function loadDevtools(window: BrowserWindow) {
 }
 
 export const isAppLocked = () => isLocked
-export const loadMainWindow = () => {
+export const loadMainWindow = (show = process.env.NODE_ENV !== 'development' && !argv.hide) => {
     //start main window
     const winSize = getConfig().winSize
-    const theme = getConfig().theme
-    const themeColor =
-        theme === 'auto'
-            ? nativeTheme.shouldUseDarkColors
-                ? '#131415'
-                : '#FFFFFF'
-            : theme === 'dark'
-              ? '#131415'
-              : '#FFFFFF'
+    const themeColor = themes.getThemeBackgroundColor()
     mainWindow = newIcalinguaWindow(
         {
             height: winSize.height,
             width: winSize.width,
-            show: process.env.NODE_ENV !== 'development' && !argv.hide,
+            minHeight: MAIN_WINDOW_MIN_SIZE.height,
+            minWidth: MAIN_WINDOW_MIN_SIZE.width,
+            frame: !getConfig().hideTitleBar,
+            show,
             backgroundColor: themeColor,
             autoHideMenuBar: !getConfig().showAppMenu,
             webPreferences: {
@@ -180,7 +194,10 @@ export const loadMainWindow = () => {
                 ui.messageError(PROTOCOL_UNSUPPORT)
             }
         } else if (url1.protocol === 'mqqapi:') {
-            if (action === 'group/invite_join') {
+            if (action === 'aio/inlinecmd') {
+                const command = url1.searchParams.get('command')
+                if (command) ui.setMessageText(command)
+            } else if (action === 'group/invite_join') {
                 showRequestWindow()
             } else {
                 ui.messageError(PROTOCOL_UNSUPPORT)
@@ -208,6 +225,68 @@ export const loadMainWindow = () => {
     })
 
     return mainWindow.loadURL(getWinUrl() + '#/main')
+}
+
+/** 重建主窗口以应用只能在 BrowserWindow 创建时设置的标题栏样式。 */
+export const setMainWindowTitleBarHidden = (hidden: boolean) => {
+    const apply = async () => {
+        if (getConfig().hideTitleBar === hidden) return
+
+        const previousWindow = mainWindow
+        getConfig().hideTitleBar = hidden
+
+        if (!previousWindow || previousWindow.isDestroyed()) {
+            saveConfigFile()
+            await recreateChatWindowsTitleBar()
+            return
+        }
+
+        const normalBounds = previousWindow.getNormalBounds()
+        const wasMaximized = previousWindow.isMaximized()
+        const wasFullScreen = previousWindow.isFullScreen()
+        const wasVisible = previousWindow.isVisible()
+        const wasFocused = previousWindow.isFocused()
+        const selectedRoomId = ui.getSelectedRoomId()
+
+        getConfig().winSize = {
+            width: normalBounds.width,
+            height: normalBounds.height,
+            max: wasMaximized,
+        }
+        saveConfigFile()
+
+        try {
+            await loadMainWindow(false)
+            const nextWindow = mainWindow
+            nextWindow.setBounds(normalBounds)
+            if (wasMaximized) nextWindow.maximize()
+            if (wasFullScreen) nextWindow.setFullScreen(true)
+
+            previousWindow.destroy()
+
+            if (wasVisible && !isAppLocked()) {
+                nextWindow.show()
+                if (wasFocused) nextWindow.focus()
+            }
+            if (selectedRoomId) setTimeout(() => ui.chroom(selectedRoomId), 0)
+
+            await recreateChatWindowsTitleBar()
+            updateTrayIcon()
+            updateTrayMenu()
+        } catch (error) {
+            if (mainWindow && mainWindow !== previousWindow && !mainWindow.isDestroyed()) mainWindow.destroy()
+            mainWindow = previousWindow
+            getConfig().hideTitleBar = !hidden
+            saveConfigFile()
+            throw error
+        }
+    }
+
+    const next = titleBarUpdatePromise ? titleBarUpdatePromise.catch(() => undefined).then(apply) : apply()
+    titleBarUpdatePromise = next
+    return next.finally(() => {
+        if (titleBarUpdatePromise === next) titleBarUpdatePromise = null
+    })
 }
 export const showMainWindow = () => {
     if (mainWindow && process.env.NODE_ENV !== 'development' && !argv.hide) {
@@ -244,7 +323,7 @@ export const showLoginWindow = (isConfiguringBridge = false, disableIdLogin = fa
                     contextIsolation: false,
                 },
             },
-            { stableTitle: 'Icalingua++ Login', deferShow: true },
+            { stableTitle: 'Icalingua++ Login' },
         )
 
         loginWindow.on('closed', () => {
@@ -253,9 +332,7 @@ export const showLoginWindow = (isConfiguringBridge = false, disableIdLogin = fa
 
         if (process.env.NODE_ENV === 'development') {
             loadDevtools(loginWindow)
-            // deferShow 下窗口最初 show:false，需要等 helper 的 ready-to-show
-            // show() 之后再 minimize，否则 minimize 状态会被 show() 覆盖
-            loginWindow.once('show', () => loginWindow.minimize())
+            loginWindow.minimize()
         }
 
         return loginWindow.loadURL(
@@ -279,7 +356,7 @@ export const showRequestWindow = () => {
                 },
                 autoHideMenuBar: true,
             },
-            { stableTitle: 'Icalingua++ FriendRequest', deferShow: true },
+            { stableTitle: 'Icalingua++ FriendRequest' },
         )
 
         if (process.env.NODE_ENV === 'development') {
@@ -293,6 +370,24 @@ export const sendToLoginWindow = (channel: string, payload?: any) => {
     if (loginWindow) loginWindow.webContents.send(channel, payload)
     else showLoginWindow().then(() => loginWindow.webContents.send(channel, payload))
 }
+export const sendDatabaseUpgradeProgress = (
+    progress: DatabaseUpgradeProgress,
+    source: DatabaseUpgradeProgressSource = 'local',
+) => {
+    databaseUpgradeProgressBySource[source] = {
+        progress: { ...progress },
+        sequence: ++databaseUpgradeProgressSequence,
+    }
+    const activeProgress = Object.values(databaseUpgradeProgressBySource)
+        .filter(({ progress: value }) => value.active)
+        .sort((a, b) => b.sequence - a.sequence)[0]
+    databaseUpgradeProgress = activeProgress ? { ...activeProgress.progress } : emptyDatabaseUpgradeProgress()
+    if (loginWindow && !loginWindow.isDestroyed())
+        loginWindow.webContents.send('dbUpgradeProgress', databaseUpgradeProgress)
+    if (mainWindow && !mainWindow.isDestroyed())
+        mainWindow.webContents.send('dbUpgradeProgress', databaseUpgradeProgress)
+}
+export const getDatabaseUpgradeProgress = (): DatabaseUpgradeProgress => ({ ...databaseUpgradeProgress })
 export const sendToMainWindow = (channel: string, payload?: any) => {
     if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send(channel, payload)
 }
@@ -314,7 +409,7 @@ export const showSetLockPasswordWindow = () => {
                 nodeIntegration: true,
             },
         },
-        { stableTitle: 'Icalingua++ SetLockPassword', deferShow: true },
+        { stableTitle: 'Icalingua++ SetLockPassword' },
     )
     setLockPasswordWindow.loadURL(getWinUrl() + '#/setLockPassword')
 }
@@ -349,7 +444,7 @@ export const judgeLocked = (callback: () => void) => {
                         nodeIntegration: true,
                     },
                 },
-                { stableTitle: 'Icalingua++ Unlock', deferShow: true },
+                { stableTitle: 'Icalingua++ Unlock' },
             )
             unlockWindow.on('closed', () => {
                 unlockWindow = null
@@ -460,7 +555,7 @@ export const showDeviceManagerWindow = () => {
                 },
                 autoHideMenuBar: true,
             },
-            { stableTitle: 'Icalingua++ DeviceManager', deferShow: true },
+            { stableTitle: 'Icalingua++ DeviceManager' },
         )
 
         if (process.env.NODE_ENV === 'development') {
@@ -537,7 +632,7 @@ export const focusChatWindow = (roomId: number): boolean => {
 }
 
 /** 打开独立聊天窗口 */
-export const openChatWindow = async (roomId: number, roomName: string, gotoMessageId?: string) => {
+export const openChatWindow = async (roomId: number, roomName: string, gotoMessageId?: string, show = true) => {
     // 如果已经打开，聚焦并返回
     if (isRoomInChatWindow(roomId)) {
         focusChatWindow(roomId)
@@ -552,36 +647,25 @@ export const openChatWindow = async (roomId: number, roomName: string, gotoMessa
     }
 
     const size = screen.getPrimaryDisplay().size
-    const theme = getConfig().theme
-    const themeColor =
-        theme === 'auto'
-            ? nativeTheme.shouldUseDarkColors
-                ? '#131415'
-                : '#FFFFFF'
-            : theme === 'dark'
-              ? '#131415'
-              : '#FFFFFF'
-
-    const win = newIcalinguaWindow(
-        {
-            height: size.height - 200,
-            width: 900,
-            title: roomName,
-            backgroundColor: themeColor,
-            autoHideMenuBar: true,
-            webPreferences: {
-                nodeIntegration: true,
-                webSecurity: false,
-                contextIsolation: false,
-            },
+    const win = newIcalinguaWindow({
+        height: size.height - 200,
+        width: 900,
+        title: roomName,
+        frame: !getConfig().hideTitleBar,
+        show,
+        backgroundColor: themes.getThemeBackgroundColor(),
+        autoHideMenuBar: true,
+        webPreferences: {
+            nodeIntegration: true,
+            webSecurity: false,
+            contextIsolation: false,
         },
-        { deferShow: true },
-    )
+    })
 
     chatWindows.set(roomId, win)
 
     win.on('closed', () => {
-        chatWindows.delete(roomId)
+        if (chatWindows.get(roomId) === win) chatWindows.delete(roomId)
     })
 
     // 窗口聚焦时清除未读
@@ -611,6 +695,45 @@ export const openChatWindow = async (roomId: number, roomName: string, gotoMessa
         shell.openExternal(details.url)
         return { action: 'deny' }
     })
+}
+
+/** Recreate detached chat windows to apply BrowserWindow title bar options. */
+async function recreateChatWindowsTitleBar() {
+    const states = Array.from(chatWindows.entries())
+        .filter(([, win]) => !win.isDestroyed())
+        .map(([roomId, win]) => ({
+            roomId,
+            roomName: win.getTitle() || String(roomId),
+            bounds: win.getNormalBounds(),
+            wasMaximized: win.isMaximized(),
+            wasFullScreen: win.isFullScreen(),
+            wasVisible: win.isVisible(),
+            wasFocused: win.isFocused(),
+            win,
+        }))
+
+    await Promise.all(
+        states.map(async (state) => {
+            try {
+                if (chatWindows.get(state.roomId) !== state.win) return
+
+                chatWindows.delete(state.roomId)
+                state.win.destroy()
+                await openChatWindow(state.roomId, state.roomName, undefined, state.wasVisible)
+
+                const nextWindow = chatWindows.get(state.roomId)
+                if (!nextWindow || nextWindow.isDestroyed()) return
+
+                nextWindow.setBounds(state.bounds)
+                if (state.wasMaximized) nextWindow.maximize()
+                if (state.wasFullScreen) nextWindow.setFullScreen(true)
+                if (!state.wasVisible) nextWindow.hide()
+                if (state.wasFocused) nextWindow.focus()
+            } catch (error) {
+                console.error(`Failed to update title bar for chat window ${state.roomId}`, error)
+            }
+        }),
+    )
 }
 
 /** 关闭独立聊天窗口 */

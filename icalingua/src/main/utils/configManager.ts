@@ -18,7 +18,28 @@ const oldConfigFilePath = argv.config || path.join(app.getPath('userData'), '../
 
 let config: AllConfig
 
-export const saveConfigFile = () => fs.writeFileSync(configFilePath, YAML.stringify(config), 'utf8')
+type WinSizeMinimum = Pick<WinSize, 'width' | 'height'>
+
+export const MAIN_WINDOW_MIN_SIZE: WinSizeMinimum = {
+    width: 800,
+    height: 600,
+}
+export const IMAGE_VIEWER_MIN_SIZE: WinSizeMinimum = {
+    width: 480,
+    height: 320,
+}
+
+export const ensureWinSizeMinimum = (winSize: WinSize, minimum: WinSizeMinimum) => {
+    if (!Number.isFinite(winSize.width) || winSize.width < minimum.width) winSize.width = minimum.width
+    if (!Number.isFinite(winSize.height) || winSize.height < minimum.height) winSize.height = minimum.height
+    return winSize
+}
+
+export const saveConfigFile = () => {
+    ensureWinSizeMinimum(config.winSize, MAIN_WINDOW_MIN_SIZE)
+    ensureWinSizeMinimum(config.imageViewerSize, IMAGE_VIEWER_MIN_SIZE)
+    fs.writeFileSync(configFilePath, YAML.stringify(config), 'utf8')
+}
 /**
  * 要记得保存哦
  */
@@ -40,7 +61,7 @@ const emptyLoginForm: LoginForm = {
     signAPIAddress: '',
     signAPIKey: '',
     forceAlgoT544: false,
-    useNT: false,
+    useNT: true,
     apkInfo: '',
 }
 const defaultAria2Config: Aria2Config = {
@@ -49,16 +70,16 @@ const defaultAria2Config: Aria2Config = {
     host: '127.0.0.1',
     port: 6800,
     secure: false,
+    allowSelfSigned: false,
     secret: '',
     path: '/jsonrpc',
 }
 const size = screen.getPrimaryDisplay().size
 const defaultWinSize: WinSize = {
-    height: size.height - 200,
-    width: size.width - 300,
+    height: Math.max(size.height - 200, MAIN_WINDOW_MIN_SIZE.height),
+    width: Math.max(MAIN_WINDOW_MIN_SIZE.width, Math.min(size.width - 300, 1440)),
     max: false,
 }
-if (defaultWinSize.width > 1440) defaultWinSize.width = 1440
 const defaultImageViewerSize: WinSize = {
     width: 800,
     height: 600,
@@ -117,9 +138,12 @@ const defaultConfig: AllConfig = {
     externalGfsBrowser: '',
     imageViewerSize: defaultImageViewerSize,
     hideTray: false,
+    hideTitleBar: false,
     disableQuitShortcut: false,
     stickerPanelBottom: false,
     stickerPanelHeight: 320,
+    compressImages: false,
+    bridgeLocalDatabaseSync: false,
 }
 if (!fs.existsSync(configFilePath) && fs.existsSync(oldConfigFilePath)) {
     migrateData()
@@ -168,6 +192,7 @@ if (fs.existsSync(configFilePath)) {
             config['winSize'][i] = defaultWinSize[i]
         }
     }
+    ensureWinSizeMinimum(config.winSize, MAIN_WINDOW_MIN_SIZE)
     if (!config['imageViewerSize']) {
         config['imageViewerSize'] = defaultImageViewerSize
     } else {
@@ -177,6 +202,7 @@ if (fs.existsSync(configFilePath)) {
             }
         }
     }
+    ensureWinSizeMinimum(config.imageViewerSize, IMAGE_VIEWER_MIN_SIZE)
 
     if (typeof config.darkTaskIcon === 'boolean') config.darkTaskIcon = config.darkTaskIcon ? 'true' : 'false'
     saveConfigFile()

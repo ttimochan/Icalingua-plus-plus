@@ -18,7 +18,13 @@ import axios from 'axios'
 import { FakeMessage, FriendInfo, GroupInfo, MemberInfo, FileElem } from 'oicq-icalingua-plus-plus'
 import { getConfig, saveConfigFile } from '../utils/configManager'
 import { createTray, updateTrayIcon } from '../utils/trayManager'
-import { getMainWindow, loadMainWindow, sendToLoginWindow, showLoginWindow } from '../utils/windowManager'
+import {
+    getMainWindow,
+    loadMainWindow,
+    sendDatabaseUpgradeProgress,
+    sendToLoginWindow,
+    showLoginWindow,
+} from '../utils/windowManager'
 import errorHandler from '../utils/errorHandler'
 import getBuildInfo from '../utils/getBuildInfo'
 import ui from '../utils/ui'
@@ -147,10 +153,18 @@ const initStorage = async () => {
     try {
         switch (loginForm.storageType) {
             case 'mdb':
-                storage = new MongoStorageProvider(loginForm.mdbConnStr, loginForm.username)
+                storage = new MongoStorageProvider(
+                    loginForm.mdbConnStr,
+                    loginForm.username,
+                    path.join(app.getPath('userData'), 'data'),
+                )
                 break
             case 'redis':
-                storage = new RedisStorageProvider(loginForm.rdsHost, `${loginForm.username}`)
+                storage = new RedisStorageProvider(
+                    loginForm.rdsHost,
+                    `${loginForm.username}`,
+                    path.join(app.getPath('userData'), 'data'),
+                )
                 break
             case 'sqlite':
                 storage = new SQLStorageProvider(
@@ -167,6 +181,7 @@ const initStorage = async () => {
                     `${loginForm.username}`,
                     'mysql',
                     {
+                        searchDataPath: path.join(app.getPath('userData'), 'data'),
                         host: loginForm.sqlHost,
                         user: loginForm.sqlUsername,
                         password: loginForm.sqlPassword,
@@ -180,6 +195,7 @@ const initStorage = async () => {
                     `${loginForm.username}`,
                     'pg',
                     {
+                        searchDataPath: path.join(app.getPath('userData'), 'data'),
                         host: loginForm.sqlHost,
                         user: loginForm.sqlUsername,
                         password: loginForm.sqlPassword,
@@ -191,9 +207,10 @@ const initStorage = async () => {
             default:
                 break
         }
-        if (storage instanceof SQLStorageProvider) {
-            storage.onUpgradeProgress = (step, total, message) => {
-                sendToLoginWindow('dbUpgradeProgress', { step, total, message })
+        if (storage) {
+            storage.onUpgradeProgress = (progress) => {
+                sendDatabaseUpgradeProgress(progress)
+                if (!progress.active) void updateAppMenu()
             }
         }
         await storage.connect()
@@ -211,6 +228,8 @@ const initStorage = async () => {
 }
 
 const adapter: Adapter = {
+    isMessageSearchIndexReady: () => storage?.isMessageSearchIndexReady?.() === true,
+    validateMessageSearchIndex: () => storage?.validateMessageSearchIndex?.() || Promise.resolve(),
     // ==================== 需要实现的读取方法 ====================
 
     async createBot(form: LoginForm) {
@@ -478,6 +497,16 @@ const adapter: Adapter = {
     clearRoomUnread(roomId: number): any {
         // 只读模式可以清除未读（本地操作）
         ui.clearRoomUnread(roomId)
+    },
+
+    async markRoomUnread(roomId: number): Promise<void> {
+        const room = await storage.getRoom(roomId)
+        if (!room) return
+        room.unreadCount = Math.max(room.unreadCount || 0, 1)
+        room.at = false
+        await storage.updateRoom(roomId, { unreadCount: room.unreadCount, at: false })
+        ui.updateRoom(room)
+        await updateTrayIcon()
     },
 
     setRoomPriority(roomId: number, priority: 1 | 2 | 3 | 4 | 5): any {
