@@ -134,7 +134,9 @@
                         :messages-loaded="messagesLoaded"
                         :show-audio="true"
                         :show-reaction-emojis="false"
-                        :show-new-messages-divider="false"
+                        :show-new-messages-divider="!isInMiddle"
+                        :unread-divider-count="unreadDividerCount"
+                        :unread-divider-target-id="unreadDividerTargetId"
                         :load-first-room="false"
                         :accepted-files="'*'"
                         :message-actions="[]"
@@ -160,8 +162,11 @@
                         :isSteamVrRunning="isSteamVrRunning"
                         :window-drag-enabled="hideTitleBar"
                         :canLoadAfter="isInMiddle"
+                        :pending-messages-count="deferredIncomingMessages.length"
                         @clear-last-unread-count="clearLastUnreadCount"
                         @clear-last-unread-at="clearLastUnreadAt"
+                        @locate-message="locateMessage"
+                        @locate-unread-message="locateUnreadMessage"
                         @send-message="sendMessage"
                         @open-file="openImage"
                         @pokefriend="pokeFriend"
@@ -172,6 +177,7 @@
                         @open-forward="openForward"
                         @fetch-messages="fetchMessage"
                         @fetch-messages-after="fetchMessageAfter"
+                        @return-to-latest="returnToLatest"
                         @open-group-member-panel="
                             ;((groupmemberShown = true), (groupmemberPanelGin = -selectedRoom.roomId))
                         "
@@ -224,47 +230,15 @@
                         v-show="panel && selectedRoomId"
                         @mousedown="startStickerHeightResize"
                     ></div>
-                    <transition name="vac-fade-stickers">
+                    <transition name="vac-stickers-panel-bottom">
                         <div
                             v-show="panel && selectedRoomId"
                             class="panel sticker-bottom-container"
                             :style="{ height: stickerPanelHeight + 'px' }"
                         >
-                            <transition name="vac-fade-stickers">
-                                <Stickers
-                                    v-show="panel === 'stickers'"
-                                    :open="panel === 'stickers'"
-                                    :bottomMode="true"
-                                    @send="sendSticker"
-                                    @close="panel = ''"
-                                    @selectEmoji="
-                                        $refs.room.useMessageContent($event.data)
-                                        $refs.room.focusTextarea()
-                                    "
-                                    @selectFace="
-                                        $refs.room.useMessageContent(`[Face: ${$event}]`)
-                                        $refs.room.focusTextarea()
-                                    "
-                                    @sendLottie="sendLottie"
-                                />
-                            </transition>
-                        </div>
-                    </transition>
-                </template>
-            </div>
-            <!-- 侧边模式（默认）：分隔条 + 右侧表情面板 -->
-            <template v-if="!stickerPanelBottom">
-                <MultipaneResizer class="resize-next" v-show="panel && selectedRoomId" />
-                <transition name="vac-fade-stickers">
-                    <div
-                        :style="{ minWidth: '300px', width: '320px', maxWidth: '500px' }"
-                        v-show="panel && selectedRoomId"
-                        class="panel panel-right"
-                    >
-                        <transition name="vac-fade-stickers">
                             <Stickers
-                                v-show="panel === 'stickers'"
                                 :open="panel === 'stickers'"
+                                :bottomMode="true"
                                 @send="sendSticker"
                                 @close="panel = ''"
                                 @selectEmoji="
@@ -277,7 +251,33 @@
                                 "
                                 @sendLottie="sendLottie"
                             />
-                        </transition>
+                        </div>
+                    </transition>
+                </template>
+            </div>
+            <!-- 侧边模式（默认）：分隔条 + 右侧表情面板 -->
+            <template v-if="!stickerPanelBottom">
+                <MultipaneResizer class="resize-next" v-show="panel && selectedRoomId" />
+                <transition name="vac-stickers-panel-side">
+                    <div
+                        :style="{ minWidth: '300px', width: '320px', maxWidth: '500px' }"
+                        v-show="panel && selectedRoomId"
+                        class="panel panel-right sticker-panel-popup"
+                    >
+                        <Stickers
+                            :open="panel === 'stickers'"
+                            @send="sendSticker"
+                            @close="panel = ''"
+                            @selectEmoji="
+                                $refs.room.useMessageContent($event.data)
+                                $refs.room.focusTextarea()
+                            "
+                            @selectFace="
+                                $refs.room.useMessageContent(`[Face: ${$event}]`)
+                                $refs.room.focusTextarea()
+                            "
+                            @sendLottie="sendLottie"
+                        />
                     </div>
                 </transition>
             </template>
@@ -364,7 +364,6 @@ import DialogAskCheckUpdate from '../components/DialogAskCheckUpdate.vue'
 import CommonGroupsDialog from '../components/CommonGroupsDialog.vue'
 import { Multipane, MultipaneResizer } from '../components/multipane'
 import path from 'path'
-import { ipcRenderer } from 'electron'
 import SideBarIcon from '../components/SideBarIcon.vue'
 import GroupChatIcon from '../components/GroupChatIcon.vue'
 import TheRoomsPanel from '../components/TheRoomsPanel.vue'
@@ -379,8 +378,20 @@ import createRoom from '../../utils/createRoom'
 import removeGroupNameEmotes from '../../utils/removeGroupNameEmotes'
 import groupMemberCache from '../utils/groupMemberCache'
 import { processFiles } from '../utils/processFiles'
+import { createRendererLifecycleScope } from '../utils/rendererLifecycleScope'
+import { shouldCountChatGroupUnread } from '../utils/chatGroupUnread'
+import { createRoomUpdateBatch, mergeRoomUpdatesByUtime } from '../utils/roomUpdateBatch'
+import {
+    compareMessageOrder,
+    getMessageCursor,
+    mergeMessageLists,
+    messageIdKey,
+    normalizeMessageList,
+} from '../utils/messageOrder'
 import fs from 'fs'
 import * as themes from '../utils/themes'
+
+const NEARBY_MESSAGE_LOAD_LIMIT = 100
 
 export default {
     components: {
@@ -403,6 +414,14 @@ export default {
         return {
             rooms: [],
             messages: [],
+            messageIndex: new Map(),
+            pendingIncomingMessages: [],
+            pendingIncomingIds: new Set(),
+            pendingIncomingRoomId: null,
+            pendingIncomingFrame: null,
+            deferredIncomingMessages: [],
+            deferredIncomingIds: new Set(),
+            messageLoadGeneration: 0,
             selectedRoomId: 0,
             account: 0,
             messagesLoaded: false,
@@ -431,8 +450,12 @@ export default {
             forwardMulti: false,
             forwardAnonymous: false,
             lastUnreadCount: 0,
+            unreadDividerCount: 0,
+            unreadDividerTargetId: null,
+            unreadDividerSessionGeneration: 0,
             lastUnreadCheck: 0,
             lastUnreadAt: false,
+            lastUnreadAtMessageId: null,
             lastUnreadCheck2: 0,
             selectedChatGroup: 'chats',
             chatGroups: [],
@@ -441,6 +464,7 @@ export default {
             uploadProgress: '0',
             chatGroupsUnreadCount: {},
             disableChatGroupsRedPoint: false,
+            countAtAllInChatGroups: true,
             useSinglePanel: false,
             showSinglePanel: false,
             removeGroupNameEmotes: false,
@@ -474,6 +498,15 @@ export default {
         }
     },
     async created() {
+        this.lifecycleScope = createRendererLifecycleScope()
+        const roomUpdateBatch = createRoomUpdateBatch({
+            schedule: (callback) => this.lifecycleScope.animationFrame(callback),
+            cancel: (frame) => this.lifecycleScope.cancelAnimationFrame(frame),
+            apply: (updates) => {
+                this.rooms = mergeRoomUpdatesByUtime(this.rooms, updates)
+            },
+        })
+        this.lifecycleScope.addCleanup(roomUpdateBatch.clear)
         //region set status
         const STORE_PATH = await ipc.getStorePath()
         const ver = await ipc.getVersion()
@@ -482,6 +515,7 @@ export default {
         this.linkify = settings.linkify
         this.disableChatGroups = settings.disableChatGroups
         this.disableChatGroupsRedPoint = settings.disableChatGroupsRedPoint
+        this.countAtAllInChatGroups = settings.countAtAllInChatGroups
         this.roomPanelAvatarOnly = settings.roomPanelAvatarOnly
         this.roomPanelWidth = settings.roomPanelWidth
         this.useSinglePanel = settings.useSinglePanel
@@ -492,14 +526,14 @@ export default {
         this.stickerPanelHeight = settings.stickerPanelHeight || 320
         //endregion
         //region listener
-        ipcRenderer.on('dbUpgradeProgress', (_, progress) => {
+        this.lifecycleScope.onIpc('dbUpgradeProgress', (_, progress) => {
             this.dbUpgrade = progress
         })
-        document.addEventListener('dragover', (e) => {
+        this.lifecycleScope.onEvent(document, 'dragover', (e) => {
             e.preventDefault()
             e.stopPropagation()
         })
-        document.addEventListener('click', (e) => {
+        this.lifecycleScope.onEvent(document, 'click', (e) => {
             const stickers_panel = document.getElementsByClassName('panel panel-right')
             const vac_room_footer = document.getElementsByClassName('vac-room-footer')
             if (
@@ -512,7 +546,7 @@ export default {
             }
         })
         //mouse side buttons (back/forward)
-        document.addEventListener('mouseup', (e) => {
+        this.lifecycleScope.onEvent(document, 'mouseup', (e) => {
             if (e.button === 3) {
                 e.preventDefault()
                 this.navBack()
@@ -522,7 +556,7 @@ export default {
             }
         })
         //keyboard
-        document.addEventListener('keydown', (e) => {
+        this.lifecycleScope.onEvent(document, 'keydown', (e) => {
             if (e.isComposing) return
             if (e.repeat) {
                 return
@@ -624,7 +658,7 @@ export default {
 
         themes.$$DON_CALL$$fetchThemes(STORE_PATH)
 
-        ipcRenderer.on('setDisableChatGroupsSeeting', (_, p) => {
+        this.lifecycleScope.onIpc('setDisableChatGroupsSeeting', (_, p) => {
             this.disableChatGroups = p
             this.selectedChatGroup = 'chats'
             if (p) {
@@ -634,7 +668,7 @@ export default {
                 this._recomputeChatGroupsUnreadCount()
             }
         })
-        ipcRenderer.on('setDisableChatGroupsRedPointSeeting', (_, p) => {
+        this.lifecycleScope.onIpc('setDisableChatGroupsRedPointSeeting', (_, p) => {
             this.disableChatGroupsRedPoint = p
             if (!p) {
                 this._rebuildRoomToGroupIndex()
@@ -643,23 +677,27 @@ export default {
                 this.chatGroupsUnreadCount = {}
             }
         })
-        ipcRenderer.on('openGroupMemberPanel', (_, p) => {
+        this.lifecycleScope.onIpc('setCountAtAllInChatGroups', (_, enabled) => {
+            this.countAtAllInChatGroups = enabled
+            this._recomputeChatGroupsUnreadCount()
+        })
+        this.lifecycleScope.onIpc('openGroupMemberPanel', (_, p) => {
             this.groupmemberShown = p.shown
             this.groupmemberPanelGin = p.gin
         })
-        ipcRenderer.on('closeLoading', () => {
+        this.lifecycleScope.onIpc('closeLoading', () => {
             this.loading = false
             this.uploadProgress = '0'
         })
-        ipcRenderer.on('notify', (_, p) => this.$notify(p))
-        ipcRenderer.on('addHistoryCount', (_, p) => {
+        this.lifecycleScope.onIpc('notify', (_, p) => this.$notify(p))
+        this.lifecycleScope.onIpc('addHistoryCount', (_, p) => {
             this.historyCount += p.count
             this.historyFetchingName = (p.roomId < 0 ? '群聊' : '私聊') + Math.abs(p.roomId)
         })
-        ipcRenderer.on('clearHistoryCount', () => (this.historyCount = 0))
-        ipcRenderer.on('notifyError', (_, p) => this.$notify.error(p))
-        ipcRenderer.on('notifySuccess', (_, p) => this.$notify.success(p))
-        ipcRenderer.on('notifyProgress', (_, { id, string }) => {
+        this.lifecycleScope.onIpc('clearHistoryCount', () => (this.historyCount = 0))
+        this.lifecycleScope.onIpc('notifyError', (_, p) => this.$notify.error(p))
+        this.lifecycleScope.onIpc('notifySuccess', (_, p) => this.$notify.success(p))
+        this.lifecycleScope.onIpc('notifyProgress', (_, { id, string }) => {
             const progressBar = this.$createElement('ProgressBar')
             const notification = this.$notify({
                 message: this.$createElement('div', [string, progressBar]),
@@ -673,19 +711,19 @@ export default {
             })
             this.notifyProgresses.set(id, { progressBar, notification })
         })
-        ipcRenderer.on('notifyProgressValue', (_, { id, value }) => {
+        this.lifecycleScope.onIpc('notifyProgressValue', (_, { id, value }) => {
             const instance = this.notifyProgresses.get(id)
             if (instance) {
                 instance.progressBar.componentInstance.setValue(value)
             }
         })
-        ipcRenderer.on('notifyProgressClose', (_, id) => {
+        this.lifecycleScope.onIpc('notifyProgressClose', (_, id) => {
             const instance = this.notifyProgresses.get(id)
             if (instance) {
                 instance.notification.close()
             }
         })
-        ipcRenderer.on('notifyDownloadComplete', (_, { fileName, filePath }) => {
+        this.lifecycleScope.onIpc('notifyDownloadComplete', (_, { fileName, filePath }) => {
             const message = this.$createElement(DownloadCompleteNotification, {
                 props: { fileName },
                 on: { open: () => ipc.openDownloadedFile(filePath) },
@@ -698,12 +736,12 @@ export default {
                 duration: 10000,
             })
         })
-        ipcRenderer.on('message', (_, p) => this.$message(p))
-        ipcRenderer.on('messageError', (_, p) => this.$message.error(p))
-        ipcRenderer.on('messageSuccess', (_, p) => this.$message.success(p))
-        ipcRenderer.on('setShutUp', (_, p) => (this.isShutUp = p))
-        ipcRenderer.on('chroom', (_, p) => this.chroom(p))
-        ipcRenderer.on('confirmIgnoreChat', (_, data) => {
+        this.lifecycleScope.onIpc('message', (_, p) => this.$message(p))
+        this.lifecycleScope.onIpc('messageError', (_, p) => this.$message.error(p))
+        this.lifecycleScope.onIpc('messageSuccess', (_, p) => this.$message.success(p))
+        this.lifecycleScope.onIpc('setShutUp', (_, p) => (this.isShutUp = p))
+        this.lifecycleScope.onIpc('chroom', (_, p) => this.chroom(p))
+        this.lifecycleScope.onIpc('confirmIgnoreChat', (_, data) => {
             const message = [
                 '屏蔽群聊将不再接受该群的消息。',
                 '屏蔽个人将不再接受此人发送的私聊消息，且会自动隐藏其发送的群消息。',
@@ -716,7 +754,7 @@ export default {
                 ipc.ignoreChat(data)
             })
         })
-        ipcRenderer.on('confirmDeleteMessage', (_, { roomId, messageId }) => {
+        this.lifecycleScope.onIpc('confirmDeleteMessage', (_, { roomId, messageId }) => {
             this.$confirm('确定撤回群成员消息?', '提示', {
                 confirmButtonText: '确定',
                 cancelButtonText: '取消',
@@ -725,7 +763,7 @@ export default {
                 ipc.deleteMessage(roomId, messageId)
             })
         })
-        ipcRenderer.on('confirmDeleteSticker', (_, filename) => {
+        this.lifecycleScope.onIpc('confirmDeleteSticker', (_, filename) => {
             this.$confirm('确定删除本 Sticker?', '提示', {
                 confirmButtonText: '确定',
                 cancelButtonText: '取消',
@@ -734,7 +772,7 @@ export default {
                 fs.unlink(path.join(filename), () => this.$message('删除成功'))
             })
         })
-        ipcRenderer.on('confirmDeleteStickerDir', (_, dirname) => {
+        this.lifecycleScope.onIpc('confirmDeleteStickerDir', (_, dirname) => {
             this.$confirm('确定删除 Sticker 分类 ' + dirname + '?', '提示', {
                 confirmButtonText: '确定',
                 cancelButtonText: '取消',
@@ -745,7 +783,7 @@ export default {
                 )
             })
         })
-        ipcRenderer.on('moveSticker', async (_, filename) => {
+        this.lifecycleScope.onIpc('moveSticker', async (_, filename) => {
             /** @type {string} */
             let value
             try {
@@ -780,120 +818,127 @@ export default {
             }
             this.$message.success('移动成功')
         })
-        ipcRenderer.on('sendDice', (_) => {
+        this.lifecycleScope.onIpc('sendDice', (_) => {
             this.sendDiceShown = true
         })
-        ipcRenderer.on('sendRps', (_) => {
+        this.lifecycleScope.onIpc('sendRps', (_) => {
             this.sendRpsShown = true
         })
-        ipcRenderer.on('updateRoom', (_, room) => {
-            const oldRooms = this.rooms.filter((item) => item.roomId !== room.roomId)
-            let left = 0,
-                right = oldRooms.length - 1,
-                mid = 0
-            while (left <= right) {
-                mid = Math.floor((left + right) / 2)
-                if (room.utime > oldRooms[mid].utime) {
-                    right = mid - 1
-                } else {
-                    left = mid + 1
-                }
-            }
-            this.rooms = [...oldRooms.slice(0, left), room, ...oldRooms.slice(left)]
-            this._recomputeChatGroupsUnreadCount()
+        this.lifecycleScope.onIpc('updateRoom', (_, room) => {
+            roomUpdateBatch.queue(room)
         })
-        ipcRenderer.on('addMessage', (_, { roomId, message }) => {
-            message.__v_skip = true
+        this.lifecycleScope.onIpc('addMessage', (_, { roomId, message }) => {
             if (roomId !== this.selectedRoomId) return
-            const index = this.messages.findIndex((e) => e._id === message._id)
+            this.queueIncomingMessage(roomId, message)
+        })
+        this.lifecycleScope.onIpc('deleteMessage', (_, messageId) => {
+            const index = this.getMessageIndex(messageId)
             if (index !== -1) {
-                console.warning(`[WARN] Duplicated message ID ${message._id}`, message, this.messages[index])
-                return
-            }
-            this.messages = [...this.messages, message]
-            if (this.lastUnreadCount >= 10 && !message.system) this.lastUnreadCount++
-            if (message.at && message.senderId != this.account) this.lastUnreadAt = true
-            if (message.system) {
-                const memberChangeText = ['加入了本群', '离开了本群', '踢了']
-                for (const text of memberChangeText) {
-                    if (message.content.includes(text)) {
-                        this.$refs.room.updateGroupMembers()
-                        break
-                    }
-                }
-            }
-        })
-        ipcRenderer.on('deleteMessage', (_, messageId) => {
-            const message = this.messages.find((e) => e._id === messageId)
-            if (message) {
-                message.deleted = Date.now()
-                message.reveal = false
-                this.messages = [...this.messages]
-            }
-        })
-        ipcRenderer.on('hideMessage', (_, messageId) => {
-            const message = this.messages.find((e) => e._id === messageId)
-            if (message) {
-                message.hide = true
-                message.reveal = false
-                this.messages = [...this.messages]
-            }
-        })
-        ipcRenderer.on('revealMessage', (_, messageId) => {
-            const message = this.messages.find((e) => e._id === messageId)
-            if (message) {
-                message.hide = false
-                message.reveal = true
-                this.messages = [...this.messages]
-            }
-        })
-        ipcRenderer.on('renewMessage', (_, { messageId, message }) => {
-            const oldMessageIndex = this.messages.findIndex((e) => e._id === messageId)
-            if (oldMessageIndex !== -1 && message) {
-                this.messages[oldMessageIndex] = {
-                    ...this.messages[oldMessageIndex],
+                this.$set(this.messages, index, {
+                    ...this.messages[index],
+                    deleted: Date.now(),
+                    reveal: false,
+                })
+            } else
+                this.updateQueuedIncomingMessage(messageId, (message) => ({
                     ...message,
-                }
-                this.messages = [...this.messages]
+                    deleted: Date.now(),
+                    reveal: false,
+                }))
+        })
+        this.lifecycleScope.onIpc('hideMessage', (_, messageId) => {
+            const index = this.getMessageIndex(messageId)
+            if (index !== -1) {
+                this.$set(this.messages, index, {
+                    ...this.messages[index],
+                    hide: true,
+                    reveal: false,
+                })
+            } else
+                this.updateQueuedIncomingMessage(messageId, (message) => ({
+                    ...message,
+                    hide: true,
+                    reveal: false,
+                }))
+        })
+        this.lifecycleScope.onIpc('revealMessage', (_, messageId) => {
+            const index = this.getMessageIndex(messageId)
+            if (index !== -1) {
+                this.$set(this.messages, index, {
+                    ...this.messages[index],
+                    hide: false,
+                    reveal: true,
+                })
+            } else
+                this.updateQueuedIncomingMessage(messageId, (message) => ({
+                    ...message,
+                    hide: false,
+                    reveal: true,
+                }))
+        })
+        this.lifecycleScope.onIpc('renewMessage', (_, { messageId, message }) => {
+            const index = this.getMessageIndex(messageId)
+            if (index !== -1 && message) {
+                this.$set(this.messages, index, {
+                    ...this.messages[index],
+                    ...message,
+                })
+            } else if (message) this.updateQueuedIncomingMessage(messageId, (current) => ({ ...current, ...message }))
+        })
+        this.lifecycleScope.onIpc('renewMessageURL', (_, { messageId, URL }) => {
+            const index = this.getMessageIndex(messageId)
+            const message = index === -1 ? null : this.messages[index]
+            if (message && message.file && URL !== 'error') {
+                this.$set(this.messages, index, {
+                    ...message,
+                    file: {
+                        ...message.file,
+                        url: URL,
+                    },
+                })
+            } else if (URL !== 'error') {
+                this.updateQueuedIncomingMessage(messageId, (current) => ({
+                    ...current,
+                    file: current.file ? { ...current.file, url: URL } : current.file,
+                }))
             }
         })
-        ipcRenderer.on('renewMessageURL', (_, { messageId, URL }) => {
-            const message = this.messages.find((e) => e._id === messageId)
-            if (message && URL !== 'error') {
-                message.file.url = URL
-                this.messages = [...this.messages]
-            }
-        })
-        ipcRenderer.on('setOnline', () => (this.reconnecting = this.offline = false))
-        ipcRenderer.on('setOffline', (_, msg) => {
+        this.lifecycleScope.onIpc('setOnline', () => (this.reconnecting = this.offline = false))
+        this.lifecycleScope.onIpc('setOffline', (_, msg) => {
             this.offlineReason = msg
             this.offline = true
         })
-        ipcRenderer.on('clearCurrentRoomUnread', () => {
+        this.lifecycleScope.onIpc('clearCurrentRoomUnread', () => {
             this.selectedRoom.unreadCount = 0
             this._recomputeChatGroupsUnreadCount()
         })
-        ipcRenderer.on('clearRoomUnread', (_, roomId) => {
+        this.lifecycleScope.onIpc('clearRoomUnread', (_, roomId) => {
             const room = this.rooms.find((e) => e.roomId === roomId)
             if (room) {
                 room.unreadCount = 0
                 room.at = false
+                room.atMessageId = null
                 this._recomputeChatGroupsUnreadCount()
             }
         })
-        ipcRenderer.on('updatePriority', (_, p) => (this.priority = p))
-        ipcRenderer.on('setAllRooms', (_, p) => (this.rooms = p))
-        ipcRenderer.on('setAllChatGroups', (_, p) => (this.chatGroups = p || []))
-        ipcRenderer.on('setMessages', (_, p) => {
-            for (const message of p) {
-                message.__v_skip = true
-            }
-            this.messages = p
+        this.lifecycleScope.onIpc('updatePriority', (_, p) => (this.priority = p))
+        this.lifecycleScope.onIpc('setAllRooms', (_, p) => {
+            roomUpdateBatch.clear()
+            this.rooms = p
+        })
+        this.lifecycleScope.onIpc('setAllChatGroups', (_, p) => (this.chatGroups = p || []))
+        this.lifecycleScope.onIpc('setMessages', (_, p) => {
+            this.messageLoadGeneration++
+            this.cancelPendingIncomingMessages()
+            this.clearDeferredIncomingMessages()
+            this.isInMiddle = false
+            const messages = p || []
+            this.setMessageList(messages)
             this.messagesLoaded = false
         })
-        ipcRenderer.on('startChat', (_, { id, name }) => this.startChat(id, name))
-        ipcRenderer.on('closePanel', () => (this.panel = ''))
-        ipcRenderer.on(
+        this.lifecycleScope.onIpc('startChat', (_, { id, name }) => this.startChat(id, name))
+        this.lifecycleScope.onIpc('closePanel', () => (this.panel = ''))
+        this.lifecycleScope.onIpc(
             'gotOnlineData',
             (_, { online, nick, uin, priority, sysInfo, updateCheck, isSteamVrRunning }) => {
                 this.offline = !online
@@ -911,48 +956,202 @@ Chromium ${process.versions.chrome}`
                 if (updateCheck === 'ask') this.dialogAskCheckUpdateVisible = true
 
                 // 预加载所有群的成员列表（用于查找共同群聊功能）
-                setTimeout(() => {
+                this.lifecycleScope.timeout(() => {
                     groupMemberCache.preloadAllGroups().catch((err) => {
                         console.error('Failed to preload group members:', err)
                     })
                 }, 3000) // 延迟3秒后开始预加载，避免影响启动速度
             },
         )
-        ipcRenderer.on('uploadProgress', (_, p) => {
+        this.lifecycleScope.onIpc('uploadProgress', (_, p) => {
             if (p > this.uploadProgress) {
                 this.uploadProgress = p
             }
         })
-        ipcRenderer.on('useSinglePanel', (_, b) => {
+        this.lifecycleScope.onIpc('useSinglePanel', (_, b) => {
             if (this.useSinglePanel && window.innerWidth > 720) {
                 this.$refs.roomPanel.style.width = '360px'
             }
             this.useSinglePanel = b
             this.handleResize({ target: { innerWidth: window.innerWidth } })
         })
-        ipcRenderer.on('setRemoveGroupNameEmotes', (_, b) => {
+        this.lifecycleScope.onIpc('setRemoveGroupNameEmotes', (_, b) => {
             this.removeGroupNameEmotes = b
         })
-        ipcRenderer.on('setUsePanguJsRecv', (_, b) => {
+        this.lifecycleScope.onIpc('setUsePanguJsRecv', (_, b) => {
             this.usePanguJsRecv = b
         })
-        ipcRenderer.on('setStickerPanelBottom', (_, b) => {
+        this.lifecycleScope.onIpc('setStickerPanelBottom', (_, b) => {
             this.stickerPanelBottom = b
         })
-        ipcRenderer.on('forwardSingleMessage', (_, message_id) => {
+        this.lifecycleScope.onIpc('forwardSingleMessage', (_, message_id) => {
             this.chooseForwardTarget(false, false)
         })
-        ipcRenderer.on('gotoMessage', async (_, { roomId, messageId }) => {
+        this.lifecycleScope.onIpc('gotoMessage', async (_, { roomId, messageId }) => {
             await this.gotoMessage(roomId, messageId)
         })
         ipc.setSelectedRoom(0, '')
         ipc.requestOnlineData()
 
-        window.addEventListener('resize', this.handleResize)
+        this.lifecycleScope.onEvent(window, 'resize', this.handleResize)
         this.handleResize({ target: { innerWidth: window.innerWidth } })
         console.log('加载完成')
     },
     methods: {
+        rebuildMessageIndex(messages = this.messages) {
+            const index = new Map()
+            for (let i = 0; i < messages.length; i++) {
+                const message = messages[i]
+                if (message && message._id !== undefined && message._id !== null) {
+                    index.set(messageIdKey(message._id), i)
+                }
+            }
+            this.messageIndex = index
+        },
+        getMessageIndex(messageId) {
+            const index = this.messageIndex.get(messageIdKey(messageId))
+            return index === undefined ? -1 : index
+        },
+        setMessageList(messages) {
+            const normalized = normalizeMessageList(messages || [])
+            for (const message of normalized) message.__v_skip = true
+            this.messages = normalized
+            this.rebuildMessageIndex(normalized)
+        },
+        appendMessages(messages) {
+            if (!messages.length) return
+            const newMessages = normalizeMessageList(messages).filter(
+                (message) => this.getMessageIndex(message._id) === -1,
+            )
+            if (!newMessages.length) return
+            const lastMessage = this.messages[this.messages.length - 1]
+            if (!lastMessage || compareMessageOrder(lastMessage, newMessages[0]) <= 0) {
+                const start = this.messages.length
+                for (const message of newMessages) message.__v_skip = true
+                this.messages.push(...newMessages)
+                for (let i = 0; i < newMessages.length; i++) {
+                    this.messageIndex.set(messageIdKey(newMessages[i]._id), start + i)
+                }
+                return
+            }
+            this.setMessageList(mergeMessageLists(this.messages, messages))
+        },
+        prependMessages(messages) {
+            if (!messages.length) return
+            const newMessages = normalizeMessageList(messages).filter(
+                (message) => this.getMessageIndex(message._id) === -1,
+            )
+            if (!newMessages.length) return
+            const firstMessage = this.messages[0]
+            if (!firstMessage || compareMessageOrder(newMessages[newMessages.length - 1], firstMessage) < 0) {
+                for (const message of newMessages) message.__v_skip = true
+                this.messages.unshift(...newMessages)
+                this.rebuildMessageIndex()
+                return
+            }
+            this.setMessageList(mergeMessageLists(this.messages, messages))
+        },
+        clearDeferredIncomingMessages() {
+            this.deferredIncomingMessages = []
+            this.deferredIncomingIds.clear()
+        },
+        deferIncomingMessages(messages) {
+            for (const message of messages) {
+                const key = messageIdKey(message._id)
+                if (this.getMessageIndex(message._id) !== -1 || this.deferredIncomingIds.has(key)) continue
+                this.deferredIncomingMessages.push(message)
+                this.deferredIncomingIds.add(key)
+            }
+        },
+        flushDeferredIncomingMessages() {
+            if (!this.deferredIncomingMessages.length) return
+            const messages = this.deferredIncomingMessages
+            this.clearDeferredIncomingMessages()
+            this.appendMessages(messages)
+        },
+        consumeDeferredIncomingMessages(messages) {
+            if (!this.deferredIncomingMessages.length || !messages.length) return
+            const consumedIds = new Set(messages.map((message) => messageIdKey(message._id)))
+            this.deferredIncomingMessages = this.deferredIncomingMessages.filter(
+                (message) => !consumedIds.has(messageIdKey(message._id)),
+            )
+            for (const id of consumedIds) this.deferredIncomingIds.delete(id)
+        },
+        updateQueuedIncomingMessage(messageId, update) {
+            const key = messageIdKey(messageId)
+            for (const messages of [this.pendingIncomingMessages, this.deferredIncomingMessages]) {
+                const index = messages.findIndex((message) => messageIdKey(message._id) === key)
+                if (index !== -1) this.$set(messages, index, update(messages[index]))
+            }
+        },
+        cancelPendingIncomingMessages() {
+            if (this.pendingIncomingFrame !== null) {
+                this.lifecycleScope.cancelAnimationFrame(this.pendingIncomingFrame)
+                this.pendingIncomingFrame = null
+            }
+            this.pendingIncomingMessages = []
+            this.pendingIncomingIds.clear()
+            this.pendingIncomingRoomId = null
+        },
+        queueIncomingMessage(roomId, message) {
+            if (this.pendingIncomingRoomId !== null && this.pendingIncomingRoomId !== roomId) {
+                this.cancelPendingIncomingMessages()
+            }
+            this.pendingIncomingRoomId = roomId
+
+            const existingIndex = this.getMessageIndex(message._id)
+            const key = messageIdKey(message._id)
+            if (existingIndex !== -1 || this.pendingIncomingIds.has(key) || this.deferredIncomingIds.has(key)) {
+                if (existingIndex !== -1) {
+                    console.warn(`[WARN] Duplicated message ID ${message._id}`, message, this.messages[existingIndex])
+                }
+                return
+            }
+
+            message.__v_skip = true
+            this.pendingIncomingMessages.push(message)
+            this.pendingIncomingIds.add(key)
+            if (this.pendingIncomingFrame !== null) return
+
+            this.pendingIncomingFrame = this.lifecycleScope.animationFrame(() => {
+                this.pendingIncomingFrame = null
+                this.flushIncomingMessages(roomId)
+            })
+        },
+        flushIncomingMessages(roomId = this.pendingIncomingRoomId) {
+            if (roomId === null || roomId !== this.pendingIncomingRoomId) return
+
+            const pendingMessages = this.pendingIncomingMessages
+            this.pendingIncomingMessages = []
+            this.pendingIncomingIds.clear()
+            this.pendingIncomingRoomId = null
+
+            if (roomId !== this.selectedRoomId) return
+            const newMessages = pendingMessages.filter((message) => this.getMessageIndex(message._id) === -1)
+            if (!newMessages.length) return
+
+            if (this.isInMiddle) this.deferIncomingMessages(newMessages)
+            else this.appendMessages(newMessages)
+            let groupMembersChanged = false
+            const memberChangeText = ['加入了本群', '离开了本群', '踢了']
+            for (const message of newMessages) {
+                if (this.unreadDividerCount > 0 && !message.system) this.unreadDividerCount++
+                if (this.lastUnreadCount >= 10 && !message.system) this.lastUnreadCount++
+                if (message.at && message.senderId != this.account) {
+                    this.lastUnreadAt = true
+                    this.lastUnreadAtMessageId = String(message._id)
+                }
+                if (
+                    message.system &&
+                    memberChangeText.some(
+                        (text) => typeof message.content === 'string' && message.content.includes(text),
+                    )
+                ) {
+                    groupMembersChanged = true
+                }
+            }
+            if (groupMembersChanged && this.$refs.room) this.$refs.room.updateGroupMembers()
+        },
         async sendMessage({
             content,
             roomId,
@@ -964,13 +1163,15 @@ Chromium ${process.versions.chrome}`
             sticker,
             messageType,
         }) {
-            this.loading = true
             if (!room && !roomId) {
                 room = this.selectedRoom
                 roomId = room.roomId
             }
             if (!room) room = this.rooms.find((e) => e.roomId === roomId)
             if (!roomId) roomId = room.roomId
+
+            if (this.isInMiddle && roomId === this.selectedRoomId) await this.returnToLatest()
+            this.loading = true
 
             const hasImages = (files || []).some((file) => file.type.includes('image'))
             const compressImages = hasImages ? (await ipc.getSettings()).compressImages : false
@@ -992,78 +1193,137 @@ Chromium ${process.versions.chrome}`
         clearLastUnreadCount() {
             this.lastUnreadCount = 0
         },
-        async clearLastUnreadAt() {
-            this.lastUnreadAt = false
-            await this.fetchMessage(false, this.lastUnreadCount, true)
+        async resolveUnreadDividerTarget(roomId, unreadCount, sessionGeneration = this.unreadDividerSessionGeneration) {
+            const count = Math.max(0, Math.trunc(Number(unreadCount) || 0))
+            if (!count) return null
+
+            try {
+                const targetMessageId = await ipc.resolveUnreadTargetMessageId(roomId, count)
+                if (sessionGeneration !== this.unreadDividerSessionGeneration || roomId !== this.selectedRoom.roomId)
+                    return null
+                if (targetMessageId === null || targetMessageId === undefined) return null
+
+                this.unreadDividerTargetId = messageIdKey(targetMessageId)
+                return this.unreadDividerTargetId
+            } catch (error) {
+                console.error('Failed to resolve unread divider target:', error)
+                return null
+            }
         },
-        async fetchMessage(reset, number, at = false) {
+        async clearLastUnreadAt() {
+            const atMessageId = this.lastUnreadAtMessageId
+            this.lastUnreadAt = false
+            this.lastUnreadAtMessageId = null
+            if (!atMessageId) {
+                this.$message.error('找不到未读的 @ 消息')
+                return
+            }
+            await this.$nextTick()
+            if (this.$refs.room?.scrollToMessage(atMessageId, false, true)) return
+            await this.locateMessage(atMessageId)
+        },
+        async locateMessage(messageId) {
+            const roomId = this.selectedRoom.roomId
+            const generation = ++this.messageLoadGeneration
+            this.loading = true
+            try {
+                await this.fetchMessage(false, NEARBY_MESSAGE_LOAD_LIMIT)
+                if (generation !== this.messageLoadGeneration || roomId !== this.selectedRoom.roomId) return
+                await this.$nextTick()
+                if (this.$refs.room?.scrollToMessage(messageId, false, true)) return
+            } finally {
+                if (generation === this.messageLoadGeneration) this.loading = false
+            }
+
+            if (generation === this.messageLoadGeneration && roomId === this.selectedRoom.roomId) {
+                await this.gotoMessage(roomId, messageId)
+            }
+        },
+        async locateUnreadMessage(unreadCount, notFoundMessage = '找不到未读消息') {
+            const count = Math.max(0, Math.trunc(Number(unreadCount) || 0))
+            if (!count) return
+            const roomId = this.selectedRoom.roomId
+            const generation = ++this.messageLoadGeneration
+
+            if (this.unreadDividerTargetId !== null) {
+                await this.gotoMessage(roomId, this.unreadDividerTargetId)
+                return
+            }
+
+            if (count <= NEARBY_MESSAGE_LOAD_LIMIT && !this.isInMiddle) {
+                const currentMessages = this.messages.filter((message) => !message.system)
+                const fetchNumber = Math.max(count - currentMessages.length, 0)
+                if (fetchNumber) await this.fetchMessage(false, fetchNumber)
+                if (generation !== this.messageLoadGeneration || roomId !== this.selectedRoom.roomId) return
+
+                const nonSystemMessages = this.messages.filter((message) => !message.system)
+                const target = nonSystemMessages[nonSystemMessages.length - count]
+                if (target) this.unreadDividerTargetId = messageIdKey(target._id)
+                await this.$nextTick()
+                if (target && this.$refs.room?.scrollToMessage(target._id, false, true)) return
+                this.$message.error(notFoundMessage)
+                return
+            }
+
+            this.loading = true
+            try {
+                const targetMessageId = await this.resolveUnreadDividerTarget(
+                    roomId,
+                    count,
+                    this.unreadDividerSessionGeneration,
+                )
+                if (generation !== this.messageLoadGeneration || roomId !== this.selectedRoom.roomId) return
+                if (!targetMessageId) {
+                    this.$message.error(notFoundMessage)
+                    return
+                }
+                await this.gotoMessage(roomId, targetMessageId)
+            } finally {
+                if (generation === this.messageLoadGeneration) this.loading = false
+            }
+        },
+        async fetchMessage(reset, number) {
+            let generation = this.messageLoadGeneration
             if (reset) {
+                generation = ++this.messageLoadGeneration
+                this.loading = false
+                this.cancelPendingIncomingMessages()
+                this.clearDeferredIncomingMessages()
+                this.isInMiddle = false
                 this.messagesLoaded = false
-                this.messages = []
+                this.setMessageList([])
             }
             const _roomId = this.selectedRoom.roomId
-            let msgs2add
+            let cursor = !reset && this.messages.length ? getMessageCursor(this.messages[0]) : null
+            const messagePages = []
+            let lastPage = []
+            let nonSystemMessageCount = 0
             try {
-                msgs2add = await ipc.fetchMessage(_roomId, this.messages.length)
+                do {
+                    const page = await ipc.fetchMessage(_roomId, cursor ? { before: cursor } : {})
+                    lastPage = page || []
+                    if (lastPage.length) cursor = getMessageCursor(lastPage[0])
+                    messagePages.unshift(lastPage)
+                    nonSystemMessageCount += lastPage.filter((message) => !message.system).length
+                    if (!number || nonSystemMessageCount >= number || !lastPage.length) break
+                    if (_roomId !== this.selectedRoom.roomId || generation !== this.messageLoadGeneration) return
+                } while (true)
             } catch (e) {
                 console.error('fetchMessage failed:', e)
                 return
             }
-            let nonSystemMessageCount = 0
-            if (number) {
-                while (nonSystemMessageCount < number) {
-                    if (_roomId !== this.selectedRoom.roomId) return
-                    let msgs
-                    try {
-                        msgs = await ipc.fetchMessage(_roomId, this.messages.length + msgs2add.length)
-                    } catch (e) {
-                        console.error('fetchMessage loop failed:', e)
-                        break
-                    }
-                    nonSystemMessageCount += msgs.filter((e) => !e.system).length
-                    msgs2add.unshift(...msgs)
-                    if (!msgs.length) {
-                        this.$message.error('Message not found')
-                        break
-                    }
-                }
-            }
-            setTimeout(() => {
-                if (_roomId !== this.selectedRoom.roomId) return
+            if (_roomId !== this.selectedRoom.roomId || generation !== this.messageLoadGeneration) return
 
-                const existingIds = new Set(this.messages.map((e) => e._id))
-                // 过滤掉已经存在的消息，而不是全部丢弃
-                // 旧逻辑 some+return 会导致 messagesLoaded 永远不被设为 true，
-                // 进而 Room.vue 的 loadingMessages 一直是 true，消息完全空白
-                const newMsgs = msgs2add.filter((e) => !existingIds.has(e._id))
-                if (newMsgs.length) {
-                    for (const msg of newMsgs) {
-                        msg.__v_skip = true
-                    }
-                    this.messages = [...newMsgs, ...this.messages]
-                } else {
-                    this.messagesLoaded = true
-                }
-
-                if (at) {
-                    const atMessages = this.messages.filter((e) => e.at)
-                    if (atMessages.length) {
-                        setTimeout(() => {
-                            const _id = atMessages[atMessages.length - 1]._id
-                            if (!_id) {
-                                this.$message.error('Message not found')
-                                return
-                            }
-                            console.log('last unread at message ID', _id)
-                            setTimeout(() => {
-                                this.$refs.room.scrollToMessage(_id)
-                            }, 0)
-                        }, 0)
-                    } else {
-                        this.$message.error('Message not found')
-                    }
-                }
-            }, 0)
+            const msgs2add = messagePages.flat()
+            const newIds = new Set()
+            const newMsgs = msgs2add.filter((message) => {
+                const key = messageIdKey(message._id)
+                if (this.getMessageIndex(message._id) !== -1 || newIds.has(key)) return false
+                newIds.add(key)
+                return true
+            })
+            if (newMsgs.length) this.prependMessages(newMsgs)
+            if (!lastPage.length || lastPage.length < 20) this.messagesLoaded = true
 
             return msgs2add[msgs2add.length - 1]
         },
@@ -1155,26 +1415,32 @@ Chromium ${process.versions.chrome}`
             }
             this.lastUnreadCount = room.unreadCount
             this.lastUnreadAt = !!room.at
+            this.lastUnreadAtMessageId = room.atMessageId || null
             if (this.selectedRoom.roomId != 0) {
                 this.selectedRoom.at = false
-                ipc.updateRoom(this.selectedRoom.roomId, { at: false })
+                this.selectedRoom.atMessageId = null
+                ipc.updateRoom(this.selectedRoom.roomId, { at: false, atMessageId: null })
             }
             if (this.selectedRoom.roomId === room.roomId) return
+            this.unreadDividerCount = Math.max(Number(room.unreadCount) || 0, 0)
+            this.unreadDividerSessionGeneration++
+            this.unreadDividerTargetId = null
             // 记录导航历史
             if (!this.isNavigating) {
                 this.navBackStack.push(this.selectedRoom.roomId)
                 this.navForwardStack = []
             }
+            this.cancelPendingIncomingMessages()
             this.selectedRoomId = room.roomId
             this.isInMiddle = false // 切换房间时重置中间加载状态
             ipc.setSelectedRoom(room.roomId, room.roomName)
             this.fetchMessage(true)
-
-            // 如果是群聊，更新群成员缓存
-            if (room.roomId < 0) {
-                groupMemberCache.updateGroupCache(-room.roomId).catch((err) => {
-                    console.error('Failed to update group member cache:', err)
-                })
+            if (this.unreadDividerCount > 0) {
+                this.resolveUnreadDividerTarget(
+                    room.roomId,
+                    this.unreadDividerCount,
+                    this.unreadDividerSessionGeneration,
+                )
             }
         },
         downloadImage: ipc.downloadImage,
@@ -1189,39 +1455,47 @@ Chromium ${process.versions.chrome}`
                 await this.chroom(room)
             }
 
-            // 先尝试在当前消息列表中查找
-            const existingIndex = this.messages.findIndex((m) => m._id === messageId)
-            if (existingIndex !== -1) {
-                // 消息已存在，直接滚动并高亮
-                this.$nextTick(() => {
-                    if (this.$refs.room) {
-                        this.$refs.room.scrollToMessage(messageId)
-                    }
-                })
-                return
-            }
+            // 先尝试在当前消息列表中查找，Room 内部会兼容 random 等可变字段。
+            if (this.$refs.room?.scrollToMessage(messageId, false, true)) return
 
             // 消息不在当前列表中，需要加载指定消息前后的消息
+            const generation = ++this.messageLoadGeneration
+            const previousMiddleState = this.isInMiddle
+            this.isInMiddle = true
             this.loading = true
             try {
                 const msgs = await ipc.fetchMessagesAround(roomId, messageId, 20, 20)
+                if (generation !== this.messageLoadGeneration || roomId !== this.selectedRoom.roomId) return
                 if (msgs && msgs.length > 0) {
-                    this.messages = msgs
-                    this.messagesLoaded = false // 允许继续向上加载
-                    this.isInMiddle = true // 标记从中间加载
-                    this.$nextTick(() => {
-                        if (this.$refs.room) {
-                            this.$refs.room.scrollToMessage(messageId)
-                        }
-                    })
+                    this.setMessageList(msgs)
+                    this.consumeDeferredIncomingMessages(msgs)
+                    await this.$nextTick()
+                    const targetIndex = this.getMessageIndex(messageId)
+                    const targetFound = this.$refs.room?.scrollToMessage(messageId, false, true)
+                    if (targetIndex === -1 && !targetFound) {
+                        this.$message.error('找不到该消息')
+                        this.isInMiddle = previousMiddleState
+                        if (!this.isInMiddle) this.flushDeferredIncomingMessages()
+                        return
+                    }
+                    this.messagesLoaded = targetIndex !== -1 && targetIndex < 20
+                    // Keep the window detached from the live tail until an explicit
+                    // after-cursor request proves that no gap remains.
+                    this.isInMiddle = true
                 } else {
                     this.$message.error('找不到该消息')
+                    this.isInMiddle = previousMiddleState
+                    if (!this.isInMiddle) this.flushDeferredIncomingMessages()
                 }
             } catch (e) {
                 console.error('Failed to goto message:', e)
                 this.$message.error('定位消息失败')
+                if (generation === this.messageLoadGeneration) {
+                    this.isInMiddle = previousMiddleState
+                    if (!this.isInMiddle) this.flushDeferredIncomingMessages()
+                }
             } finally {
-                this.loading = false
+                if (generation === this.messageLoadGeneration) this.loading = false
             }
         },
         async fetchMessageAfter() {
@@ -1229,27 +1503,53 @@ Chromium ${process.versions.chrome}`
             const lastMessage = this.messages[this.messages.length - 1]
             if (!lastMessage) return
 
+            const generation = this.messageLoadGeneration
+            const roomId = this.selectedRoom.roomId
             this.loading = true
             try {
-                // 使用 fetchMessagesAround，before=0 表示只获取之后的消息
-                const msgs = await ipc.fetchMessagesAround(this.selectedRoom.roomId, lastMessage._id, 0, 20)
-                if (msgs && msgs.length > 1) {
-                    // 去掉第一条（就是 lastMessage 本身）
-                    const newMsgs = msgs.slice(1)
-                    if (newMsgs.length > 0) {
-                        this.messages = [...this.messages, ...newMsgs]
-                    } else {
-                        // 没有更多新消息了，退出中间模式
-                        this.isInMiddle = false
-                    }
-                } else {
-                    // 没有更多新消息了，退出中间模式
+                const msgs = await ipc.fetchMessage(roomId, { after: getMessageCursor(lastMessage) })
+                if (generation !== this.messageLoadGeneration || roomId !== this.selectedRoom.roomId) return
+                if (msgs?.length) {
+                    this.consumeDeferredIncomingMessages(msgs)
+                    this.appendMessages(msgs)
+                }
+                if (!msgs || msgs.length < 20) {
+                    this.flushDeferredIncomingMessages()
+                    // Let Room process the tail append while canLoadAfter is still true.
+                    // Otherwise its generic messages watcher mistakes this final page for
+                    // a normal live-message update and scrolls the whole window to bottom.
+                    await this.$nextTick()
+                    if (generation !== this.messageLoadGeneration || roomId !== this.selectedRoom.roomId) return
                     this.isInMiddle = false
                 }
             } catch (e) {
                 console.error('Failed to fetch messages after:', e)
             } finally {
-                this.loading = false
+                if (generation === this.messageLoadGeneration) this.loading = false
+            }
+        },
+        async returnToLatest() {
+            const roomId = this.selectedRoom.roomId
+            if (!roomId) return false
+
+            const generation = ++this.messageLoadGeneration
+            this.loading = true
+            try {
+                const messages = (await ipc.fetchMessage(roomId, {})) || []
+                if (generation !== this.messageLoadGeneration || roomId !== this.selectedRoom.roomId) return false
+
+                this.setMessageList(messages)
+                this.isInMiddle = false
+                this.messagesLoaded = messages.length < 20
+                this.flushDeferredIncomingMessages()
+                this.$nextTick(() => this.$refs.room?.queueScrollToBottom(true))
+                return true
+            } catch (error) {
+                console.error('Failed to return to latest messages:', error)
+                this.$message.error('返回最新消息失败')
+                return false
+            } finally {
+                if (generation === this.messageLoadGeneration) this.loading = false
             }
         },
         pokeGroup(uin) {
@@ -1268,10 +1568,17 @@ Chromium ${process.versions.chrome}`
             ipc.stopFetchMessage()
         },
         closeRoom() {
+            this.messageLoadGeneration++
             this.selectedRoomId = 0
-            this.messages = []
+            this.cancelPendingIncomingMessages()
+            this.clearDeferredIncomingMessages()
+            this.setMessageList([])
             this.lastUnreadCount = 0
+            this.unreadDividerCount = 0
+            this.unreadDividerSessionGeneration++
+            this.unreadDividerTargetId = null
             this.lastUnreadAt = false
+            this.lastUnreadAtMessageId = null
             this.isInMiddle = false // 关闭房间时重置中间加载状态
             this.showPanel = 'contact'
             ipc.setSelectedRoom(0, '')
@@ -1312,13 +1619,15 @@ Chromium ${process.versions.chrome}`
                 if (next > max) next = max
                 this.stickerPanelHeight = next
             }
+            let removeMoveListener
+            let removeUpListener
             const onUp = () => {
-                window.removeEventListener('mousemove', onMove)
-                window.removeEventListener('mouseup', onUp)
+                removeMoveListener()
+                removeUpListener()
                 ipc.setStickerPanelHeight(this.stickerPanelHeight)
             }
-            window.addEventListener('mousemove', onMove)
-            window.addEventListener('mouseup', onUp)
+            removeMoveListener = this.lifecycleScope.onEvent(window, 'mousemove', onMove)
+            removeUpListener = this.lifecycleScope.onEvent(window, 'mouseup', onUp)
         },
         sendForward(id, name) {
             this.$refs.room.sendForward(id, name, this.forwardMulti, this.forwardAnonymous)
@@ -1396,7 +1705,7 @@ Chromium ${process.versions.chrome}`
         onChatGroupScroll(e) {
             this._chatGroupPendingScrollTop = e.target.scrollTop
             if (this._chatGroupScrollFrame) return
-            this._chatGroupScrollFrame = requestAnimationFrame(() => {
+            this._chatGroupScrollFrame = this.lifecycleScope.animationFrame(() => {
                 this._chatGroupScrollFrame = null
                 this._updateChatGroupScrollbarPosition(this._chatGroupPendingScrollTop)
             })
@@ -1579,7 +1888,7 @@ Chromium ${process.versions.chrome}`
             const selectedId = this.selectedRoomId
             for (const e of this.rooms) {
                 if (selectedId && e.roomId === selectedId) continue
-                if (e.unreadCount > 0 && (e.priority >= this.priority || e.at)) {
+                if (shouldCountChatGroupUnread(e, this.priority, this.countAtAllInChatGroups)) {
                     unread['chats'] = (unread['chats'] || 0) + 1
                     if (e.roomId < 0) unread['group'] = (unread['group'] || 0) + 1
                     if (e.roomId > 0) unread['private'] = (unread['private'] || 0) + 1
@@ -1655,15 +1964,17 @@ Chromium ${process.versions.chrome}`
         })
     },
     beforeDestroy() {
+        this.cancelPendingIncomingMessages()
         if (this._chatGroupResizeObserver) {
             this._chatGroupResizeObserver.disconnect()
             this._chatGroupResizeObserver = null
         }
         if (this._chatGroupScrollFrame) {
-            cancelAnimationFrame(this._chatGroupScrollFrame)
+            this.lifecycleScope.cancelAnimationFrame(this._chatGroupScrollFrame)
             this._chatGroupScrollFrame = null
         }
         if (this._onGroupMouseUp) this.onGroupThumbMouseUp()
+        this.lifecycleScope?.dispose()
     },
     watch: {
         chatGroups: {
@@ -1678,9 +1989,9 @@ Chromium ${process.versions.chrome}`
             console.log('lastUnreadCount', n)
             if (n !== 0) {
                 if (this.lastUnreadCheck) {
-                    clearTimeout(this.lastUnreadCheck)
+                    this.lifecycleScope.cancelTimeout(this.lastUnreadCheck)
                 }
-                this.lastUnreadCheck = setTimeout(() => {
+                this.lastUnreadCheck = this.lifecycleScope.timeout(() => {
                     console.log('Timeout')
                     this.lastUnreadCount = 0
                 }, 30000)
@@ -1690,11 +2001,12 @@ Chromium ${process.versions.chrome}`
             console.log('lastUnreadAt', n)
             if (n) {
                 if (this.lastUnreadCheck2) {
-                    clearTimeout(this.lastUnreadCheck2)
+                    this.lifecycleScope.cancelTimeout(this.lastUnreadCheck2)
                 }
-                this.lastUnreadCheck2 = setTimeout(() => {
+                this.lastUnreadCheck2 = this.lifecycleScope.timeout(() => {
                     console.log('Timeout')
                     this.lastUnreadAt = false
+                    this.lastUnreadAtMessageId = null
                 }, 30000)
             }
         },
@@ -1738,7 +2050,7 @@ Chromium ${process.versions.chrome}`
 .el-main {
     padding: 0;
     height: 100vh;
-    overflow-x: hidden;
+    overflow: hidden;
 }
 
 .el-aside {

@@ -5,6 +5,7 @@ import DatabaseUpgradeProgress from '@icalingua/types/DatabaseUpgradeProgress'
 import IgnoreChatInfo from '@icalingua/types/IgnoreChatInfo'
 import LoginForm from '@icalingua/types/LoginForm'
 import Message from '@icalingua/types/Message'
+import MessagePageOptions from '@icalingua/types/MessagePage'
 import OnlineData from '@icalingua/types/OnlineData'
 import RoamingStamp from '@icalingua/types/RoamingStamp'
 import Room from '@icalingua/types/Room'
@@ -12,7 +13,7 @@ import SearchableFriend from '@icalingua/types/SearchableFriend'
 import SendMessageParams from '@icalingua/types/SendMessageParams'
 import axios from 'axios'
 import { app, dialog, Notification as ElectronNotification } from 'electron'
-import fileType from 'file-type'
+import { fileTypeFromBuffer } from 'file-type'
 import { Notification } from 'freedesktop-notifications'
 import fs from 'fs'
 import { sign } from '@noble/ed25519'
@@ -195,6 +196,8 @@ const attachSocketEvents = () => {
         if (room.roomId === ui.getSelectedRoomId() && getMainWindow().isFocused() && getMainWindow().isVisible()) {
             //把它点掉
             room.unreadCount = 0
+            room.at = false
+            room.atMessageId = null
             adapter.clearRoomUnread(room.roomId)
         }
         ui.updateRoom(room)
@@ -304,7 +307,9 @@ const attachSocketEvents = () => {
     })
     socket.on('syncRead', (roomId: number) => {
         ui.clearRoomUnread(roomId)
-        queueLocalStorageWrite((storage) => storage.updateRoom(roomId, { unreadCount: 0, at: false }))
+        queueLocalStorageWrite((storage) =>
+            storage.updateRoom(roomId, { unreadCount: 0, at: false, atMessageId: null }),
+        )
     })
     socket.on('setMessages', ({ roomId, messages }: { roomId: number; messages: Message[] }) => {
         if (roomId === ui.getSelectedRoomId()) ui.setMessages(messages)
@@ -664,8 +669,9 @@ const adapter: Adapter = {
         if (room) {
             room.unreadCount = 0
             room.at = false
+            room.atMessageId = null
         }
-        adapter.updateRoom(roomId, { unreadCount: 0, at: false })
+        adapter.updateRoom(roomId, { unreadCount: 0, at: false, atMessageId: null })
         updateTrayIcon()
     },
     markRoomUnread(roomId: number) {
@@ -674,9 +680,27 @@ const adapter: Adapter = {
         if (!room) return
         room.unreadCount = Math.max(room.unreadCount || 0, 1)
         room.at = false
+        room.atMessageId = null
         ui.updateRoom(room)
-        adapter.updateRoom(roomId, { unreadCount: room.unreadCount, at: false })
+        adapter.updateRoom(roomId, { unreadCount: room.unreadCount, at: false, atMessageId: null })
         updateTrayIcon()
+    },
+    markMessageUnread(roomId: number, messageId: string) {
+        if (!socket) return
+        socket.emit('markMessageUnread', roomId, messageId, (unreadCount: number) => {
+            const count = Math.max(0, Math.trunc(Number(unreadCount) || 0))
+            if (!count) return
+            const room = rooms.find((e) => e.roomId === roomId)
+            if (!room) return
+            room.unreadCount = count
+            room.at = false
+            room.atMessageId = null
+            ui.updateRoom(room)
+            queueLocalStorageWrite((storage) =>
+                storage.updateRoom(roomId, { unreadCount: count, at: false, atMessageId: null }),
+            )
+            updateTrayIcon()
+        })
     },
     async createBot(form: LoginForm) {
         if (account) {
@@ -759,12 +783,14 @@ const adapter: Adapter = {
     fetch7DaysHistory() {
         socket.emit('fetch7DaysHistory')
     },
-    fetchMessages(roomId: number, offset: number): Promise<Message[]> {
-        if (!offset) adapter.clearCurrentRoomUnread()
+    fetchMessages(roomId: number, options: MessagePageOptions): Promise<Message[]> {
+        const initialPage = !options?.before && !options?.after
+        if (initialPage) adapter.clearCurrentRoomUnread()
         updateTrayIcon()
-        currentLoadedMessagesCount = offset + 20
         return new Promise((resolve, reject) => {
-            socket.emit('fetchMessages', roomId, offset, (messages: Message[]) => {
+            socket.emit('fetchMessages', roomId, options || {}, (messages: Message[]) => {
+                if (initialPage) currentLoadedMessagesCount = messages.length
+                else if (options?.before) currentLoadedMessagesCount += messages.length
                 queueLocalStorageWrite((storage) => persistLocalMessages(storage, roomId, messages))
                 resolve(messages)
             })
@@ -786,6 +812,11 @@ const adapter: Adapter = {
             })
         })
     },
+    resolveUnreadTargetMessageId(roomId: number, unreadCount: number): Promise<string | null> {
+        return new Promise((resolve) => {
+            socket.emit('resolveUnreadTargetMessageId', roomId, unreadCount, resolve)
+        })
+    },
     fetchMessagesBySender(roomId: number, senderId: number, offset: number): Promise<Message[]> {
         return new Promise((resolve, reject) => {
             socket.emit('fetchMessagesBySender', roomId, senderId, offset, (messages: Message[]) => {
@@ -794,12 +825,20 @@ const adapter: Adapter = {
             })
         })
     },
-    searchMessages(roomId: number, keyword: string, offset: number): Promise<Message[]> {
+    searchMessages(
+        roomId: number,
+        keyword: string,
+        offset: number,
+        senderId?: number,
+        startTime?: number,
+        endTime?: number,
+    ): Promise<Message[]> {
         return new Promise((resolve, reject) => {
-            socket.emit('searchMessages', roomId, keyword, offset, (messages: Message[]) => {
+            const handleMessages = (messages: Message[]) => {
                 queueLocalStorageWrite((storage) => persistLocalMessages(storage, roomId, messages))
                 resolve(messages)
-            })
+            }
+            socket.emit('searchMessages', roomId, keyword, offset, senderId, startTime, endTime, handleMessages)
         })
     },
     getFirstUnreadRoom(): Promise<Room> {
@@ -894,7 +933,7 @@ const adapter: Adapter = {
                 if (img.type?.startsWith('audio/') && img.fid) continue
                 if (img.url && !img.b64 && !/^https?:\/\//.test(img.url)) {
                     const fileContent = fs.readFileSync(img.url)
-                    const type = await fileType.fromBuffer(fileContent)
+                    const type = await fileTypeFromBuffer(fileContent)
                     img.b64 = 'data:' + type.mime + ';base64,' + fileContent.toString('base64')
                     img.url = null
                 }

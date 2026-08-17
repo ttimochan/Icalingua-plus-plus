@@ -3,6 +3,7 @@ import Message from './Message'
 import IgnoreChatInfo from './IgnoreChatInfo'
 import ChatGroup from './ChatGroup'
 import DatabaseUpgradeProgress from './DatabaseUpgradeProgress'
+import MessagePageOptions from './MessagePage'
 
 export default interface StorageProvider {
     connect(): Promise<void>
@@ -25,11 +26,16 @@ export default interface StorageProvider {
 
     replaceMessage(roomId: number, messageId: string | number, message: Message): Promise<any>
 
-    fetchMessages(roomId: number, skip: number, limit: number): Promise<Message[]>
+    fetchMessages(roomId: number, options: MessagePageOptions, limit: number): Promise<Message[]>
 
     fetchImageMessages(roomId: number, skip: number, limit: number, endTime?: number): Promise<Message[]>
 
     fetchMessagesAround(roomId: number, messageId: string, before: number, after: number): Promise<Message[]>
+
+    resolveUnreadTargetMessageId(roomId: number, unreadCount: number): Promise<string | null>
+
+    /** Count non-system messages from and including the specified message. */
+    countUnreadMessagesFrom(roomId: number, messageId: string | number): Promise<number>
 
     getMessage(roomId: number, messageId: string): Promise<Message>
 
@@ -62,7 +68,15 @@ export default interface StorageProvider {
     fetchMessagesBySender(roomId: number, senderId: string, skip: number, limit: number): Promise<Message[]>
 
     /** Use roomId 0 to search all conversations; global results include their original roomId. */
-    searchMessages(roomId: number, keyword: string, skip: number, limit: number): Promise<Message[]>
+    searchMessages(
+        roomId: number,
+        keyword: string,
+        skip: number,
+        limit: number,
+        senderId?: string,
+        startTime?: number,
+        endTime?: number,
+    ): Promise<Message[]>
 
     /** 关闭数据库连接，释放资源。应在进程退出前调用。 */
     close(): Promise<void>

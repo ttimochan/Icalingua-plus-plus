@@ -1,6 +1,13 @@
 import { parentPort } from 'worker_threads'
 import SQLStorageProvider, { type MessageSearchIndexFactory } from './SQLStorageProvider'
 import SQLiteMessageSearchIndex from './SQLiteMessageSearchIndex'
+import SQLiteMessageSearchIndexWorker from './SQLiteMessageSearchIndexWorker'
+import {
+    createSQLiteMessageSearchSourceCallbacks,
+    sqliteMessageSearchSourceMethod,
+    type SQLiteMessageSearchSourceCallbackOptions,
+    type SQLiteMessageSearchSourceResult,
+} from './SQLiteMessageSearchSource'
 import {
     DBWorkerCallbackRequest,
     DBWorkerCallbackResponse,
@@ -28,6 +35,7 @@ interface PendingCallback {
 const sqlMethods = new Set([
     'connect',
     'validateMessageSearchIndex',
+    'searchMessageTimes',
     'addRoom',
     'updateRoom',
     'removeRoom',
@@ -52,8 +60,29 @@ const sqlMethods = new Set([
     'fetchImageMessages',
     'getMessage',
     'fetchMessagesAround',
+    'resolveUnreadTargetMessageId',
+    'countUnreadMessagesFrom',
     'addMessages',
     'close',
+])
+
+const sqlReadMethods = new Set([
+    sqliteMessageSearchSourceMethod,
+    'getAllRooms',
+    'getRoom',
+    'getAllChatGroups',
+    'getUnreadCount',
+    'getFirstUnreadRoom',
+    'getIgnoredChats',
+    'isChatIgnored',
+    'fetchMessages',
+    'fetchMessagesBySender',
+    'searchMessages',
+    'fetchImageMessages',
+    'getMessage',
+    'fetchMessagesAround',
+    'resolveUnreadTargetMessageId',
+    'countUnreadMessagesFrom',
 ])
 
 const searchMethods = new Set([
@@ -111,12 +140,49 @@ const callParent = (targetId: string, name: string, args: unknown[]): Promise<un
     })
 }
 
-const createMessageSearchIndex: MessageSearchIndexFactory = (filePath, callbacks, errorHandle) =>
-    new SQLiteMessageSearchIndex(filePath, callbacks, errorHandle)
+const createParentMessageSearchSource = (targetId: string, options?: SQLiteMessageSearchSourceCallbackOptions) =>
+    createSQLiteMessageSearchSourceCallbacks(
+        (request) =>
+            callParent(targetId, sqliteMessageSearchSourceMethod, [
+                request,
+            ]) as Promise<SQLiteMessageSearchSourceResult>,
+        options,
+    )
+
+// Keep FTS work off the Worker that serves the primary SQLite database. Large
+// rebuilds and validation scans may take minutes, but room/message operations
+// must remain responsive while they run.
+const createMessageSearchIndex =
+    (targetId: string): MessageSearchIndexFactory =>
+    (filePath, callbacks, errorHandle) =>
+        new SQLiteMessageSearchIndexWorker(
+            filePath,
+            {
+                ...callbacks,
+                ...createParentMessageSearchSource(targetId, {
+                    loadMessageTimeCounts: Boolean(callbacks.loadMessageTimeCounts),
+                    countMessages: Boolean(callbacks.countMessages),
+                }),
+            },
+            errorHandle,
+        )
+
+const createRemoteMessageSearchIndex =
+    (targetId: string): MessageSearchIndexFactory =>
+    () => ({
+        isReady: true,
+        open: async () => undefined,
+        close: async () => undefined,
+        validate: async () => undefined,
+        syncMessages: async () => undefined,
+        requestRebuild: async () => undefined,
+        searchTimes: (keyword, options) =>
+            callParent(targetId, 'searchTimes', [keyword, options]) as Promise<number[] | null>,
+    })
 
 const createTarget = (targetId: string, kind: DBWorkerTargetKind, args: unknown[]): WorkerTarget => {
     if (targets.has(targetId)) throw new Error(`DB Worker target already exists: ${targetId}`)
-    if (kind === 'sql') {
+    if (kind === 'sql' || kind === 'sqlReader') {
         const [id, type, connectOpt] = args as ConstructorParameters<typeof SQLStorageProvider>
         if (type !== 'sqlite3') throw new Error(`Only SQLite SQL providers may run in DB Worker: ${type}`)
         let target: WorkerTarget
@@ -124,8 +190,12 @@ const createTarget = (targetId: string, kind: DBWorkerTargetKind, args: unknown[
             id,
             type,
             connectOpt,
-            (error) => postErrorEvent(targetId, error),
-            createMessageSearchIndex,
+            (error) => {
+                postErrorEvent(targetId, error)
+                throw error
+            },
+            kind === 'sql' ? createMessageSearchIndex(targetId) : createRemoteMessageSearchIndex(targetId),
+            kind === 'sqlReader',
         )
         target = { kind, instance, activeCalls: new Set(), disposing: false }
         instance.onUpgradeProgress = (progress) => {
@@ -135,25 +205,28 @@ const createTarget = (targetId: string, kind: DBWorkerTargetKind, args: unknown[
         return target
     }
 
-    const [filePath, callbackOptions] = args as [string, { loadMessageTimeCounts?: boolean; countMessages?: boolean }]
+    const [filePath, callbackOptions] = args as [
+        string,
+        {
+            loadMessageTimeCounts?: boolean
+            countMessages?: boolean
+            buildBatchSize?: number
+            validationBatchSize?: number
+        },
+    ]
     let target: WorkerTarget
     const instance = new SQLiteMessageSearchIndex(
         filePath,
         {
-            loadTimes: (afterTime, limit) => callParent(targetId, 'loadTimes', [afterTime, limit]) as Promise<number[]>,
-            loadMessagesByTimes: (times) => callParent(targetId, 'loadMessagesByTimes', [times]) as any,
-            ...(callbackOptions?.loadMessageTimeCounts
-                ? {
-                      loadMessageTimeCounts: (afterTime: number, limit: number) =>
-                          callParent(targetId, 'loadMessageTimeCounts', [afterTime, limit]) as any,
-                  }
-                : {}),
-            ...(callbackOptions?.countMessages
-                ? { countMessages: () => callParent(targetId, 'countMessages', []) as Promise<number> }
-                : {}),
+            ...createParentMessageSearchSource(targetId, {
+                loadMessageTimeCounts: Boolean(callbackOptions?.loadMessageTimeCounts),
+                countMessages: Boolean(callbackOptions?.countMessages),
+            }),
+            buildBatchSize: callbackOptions?.buildBatchSize,
+            validationBatchSize: callbackOptions?.validationBatchSize,
             reportProgress: (progress) => {
-                postEvent(targetId, 'progress', progress)
                 if (target) postTargetStatus(targetId, target)
+                postEvent(targetId, 'progress', progress)
             },
         },
         (error) => postErrorEvent(targetId, error),
@@ -201,7 +274,8 @@ const handleRequest = async (request: DBWorkerRequest): Promise<void> => {
             return
         }
 
-        const allowedMethods = target.kind === 'sql' ? sqlMethods : searchMethods
+        const allowedMethods =
+            target.kind === 'sql' ? sqlMethods : target.kind === 'sqlReader' ? sqlReadMethods : searchMethods
         if (!request.method || !allowedMethods.has(request.method)) {
             throw new Error(`Unsupported ${target.kind} DB Worker method: ${request.method}`)
         }

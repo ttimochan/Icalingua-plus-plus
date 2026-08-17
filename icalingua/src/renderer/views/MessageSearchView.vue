@@ -6,12 +6,28 @@
         <div class="search-bar">
             <el-input
                 v-model="keyword"
-                :placeholder="isGlobalSearch ? '搜索全部会话中的消息' : '输入关键词搜索当前会话'"
+                class="keyword-input"
+                :placeholder="searchPlaceholder"
                 prefix-icon="el-icon-search"
                 clearable
                 size="medium"
                 @keydown.enter.native="doSearch"
                 @clear="clearResults"
+            />
+            <el-date-picker
+                v-model="dateRange"
+                class="date-range-picker"
+                type="daterange"
+                range-separator="至"
+                start-placeholder="开始日期"
+                end-placeholder="结束日期"
+                format="yyyy-MM-dd"
+                size="medium"
+                clearable
+                :disabled="loading"
+                :picker-options="datePickerOptions"
+                :append-to-body="false"
+                @change="handleDateRangeChange"
             />
             <el-button type="primary" size="medium" @click="doSearch" :loading="loading">搜索</el-button>
         </div>
@@ -51,8 +67,8 @@
 </template>
 
 <script>
-import { ipcRenderer } from 'electron'
 import ipc from '../utils/ipc'
+import { createRendererLifecycleScope } from '../utils/rendererLifecycleScope'
 import '../utils/themes'
 
 export default {
@@ -61,35 +77,60 @@ export default {
         return {
             roomId: 0,
             roomName: '',
+            senderId: null,
+            senderName: '',
             keyword: '',
+            dateRange: null,
             messages: [],
             loading: false,
             noMore: false,
             searched: false,
             searchError: '',
+            datePickerOptions: {
+                disabledDate(date) {
+                    return date > new Date()
+                },
+            },
         }
     },
     computed: {
         isGlobalSearch() {
             return this.roomId === 0
         },
+        hasSenderFilter() {
+            return this.senderId !== null
+        },
         searchTitle() {
+            if (this.hasSenderFilter) {
+                const scopeName = this.isGlobalSearch ? '全部会话' : this.roomName
+                return `${scopeName} - 搜索 ${this.senderName || this.senderId} 的消息`
+            }
             return this.isGlobalSearch ? '全局消息搜索' : `${this.roomName} - 搜索聊天记录`
+        },
+        searchPlaceholder() {
+            if (this.hasSenderFilter) return `输入关键词搜索 ${this.senderName || this.senderId} 的消息`
+            return this.isGlobalSearch ? '搜索全部会话中的消息' : '输入关键词搜索当前会话'
         },
     },
     async created() {
+        this.lifecycleScope = createRendererLifecycleScope()
         document.title = '搜索聊天记录'
-        ipcRenderer.on('initMessageSearch', (event, { roomId, roomName }) => {
+        this.lifecycleScope.onIpc('initMessageSearch', (event, { roomId, roomName, senderId, senderName }) => {
             this.roomId = roomId
             this.roomName = roomName
+            this.senderId = senderId ?? null
+            this.senderName = senderName || ''
             document.title = this.searchTitle
         })
+    },
+    beforeDestroy() {
+        this.lifecycleScope?.dispose()
     },
     methods: {
         async doSearch() {
             if (this.loading) return
             const keyword = this.keyword.trim()
-            if (!keyword) return
+            if (!keyword && !this.hasSearchTimeRange()) return
             this.messages = []
             this.noMore = false
             this.searched = true
@@ -99,10 +140,18 @@ export default {
         async fetchResults() {
             if (this.loading || this.noMore) return
             const keyword = this.keyword.trim()
-            if (!keyword) return
+            if (!keyword && !this.hasSearchTimeRange()) return
             this.loading = true
             try {
-                const msgs = await ipc.searchMessages(this.roomId, keyword, this.messages.length)
+                const { startTime, endTime } = this.getSearchTimeRange()
+                const msgs = await ipc.searchMessages(
+                    this.roomId,
+                    keyword,
+                    this.messages.length,
+                    this.hasSenderFilter ? this.senderId : undefined,
+                    startTime,
+                    endTime,
+                )
                 if (msgs && msgs.length) {
                     this.messages = [...this.messages, ...msgs]
                 }
@@ -121,6 +170,22 @@ export default {
             this.noMore = false
             this.searched = false
             this.searchError = ''
+        },
+        handleDateRangeChange() {
+            this.clearResults()
+        },
+        getSearchTimeRange() {
+            if (!Array.isArray(this.dateRange) || this.dateRange.length !== 2) return {}
+            const start = new Date(this.dateRange[0])
+            const end = new Date(this.dateRange[1])
+            if (!Number.isFinite(start.getTime()) || !Number.isFinite(end.getTime())) return {}
+            start.setHours(0, 0, 0, 0)
+            end.setHours(23, 59, 59, 999)
+            return { startTime: start.getTime(), endTime: end.getTime() }
+        },
+        hasSearchTimeRange() {
+            const { startTime, endTime } = this.getSearchTimeRange()
+            return startTime !== undefined && endTime !== undefined
         },
         handleScroll(e) {
             const { scrollTop, scrollHeight, clientHeight } = e.target
@@ -218,6 +283,16 @@ export default {
     background: var(--chat-header-bg-color, #fff);
     border-bottom: 1px solid var(--chat-border-color, #e0e0e0);
     -webkit-app-region: no-drag;
+}
+
+.keyword-input {
+    flex: 1;
+    min-width: 0;
+}
+
+.date-range-picker {
+    flex: 0 0 350px;
+    width: 350px;
 }
 
 .search-results {

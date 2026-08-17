@@ -6,8 +6,10 @@ import Message from '@icalingua/types/Message'
 import Room from '@icalingua/types/Room'
 import ChatGroup from '@icalingua/types/ChatGroup'
 import DatabaseUpgradeProgress from '@icalingua/types/DatabaseUpgradeProgress'
+import MessagePageOptions, { MessageCursor } from '@icalingua/types/MessagePage'
 import StorageProvider from '@icalingua/types/StorageProvider'
 import { messageMatchesKeyword, normalizeSearchText } from './MessageSearchIndex'
+import { messageIdTime, messageIdsEquivalent } from './MessageId'
 import SQLiteMessageSearchIndexWorker, { SQLiteSearchMessage } from './SQLiteMessageSearchIndexWorker'
 
 const insertMessageScript = [
@@ -16,6 +18,8 @@ const insertMessageScript = [
     "redis.call('ZADD', KEYS[2], ARGV[3], ARGV[1])",
     'return 1',
 ].join('\n')
+
+const redisMessageReadBatchSize = 1000
 
 export default class RedisStorageProvider implements StorageProvider {
     qid: string
@@ -51,7 +55,21 @@ export default class RedisStorageProvider implements StorageProvider {
     /** `connect` 方法。在这里与数据库建立连接。 */
     async connect(): Promise<void> {
         this.redis = new Redis(this.connStr)
+        await this.repairRoomAtMessageIds()
         await this.searchIndex.open()
+    }
+
+    private async repairRoomAtMessageIds(): Promise<void> {
+        const rooms = await this.getAllRooms()
+        for (const room of rooms) {
+            if (!room.at || room.atMessageId) continue
+            try {
+                const atMessageId = await this.resolveRecentMessageId(room.roomId, room.unreadCount, true)
+                await this.updateRoom(room.roomId, atMessageId ? { atMessageId } : { at: false, atMessageId: null })
+            } catch (error) {
+                console.error('Failed to repair room atMessageId', room.roomId, error)
+            }
+        }
     }
 
     async close(): Promise<void> {
@@ -83,14 +101,17 @@ export default class RedisStorageProvider implements StorageProvider {
 
     private async getMessages(roomId: number, ids: string[]): Promise<Message[]> {
         if (!ids.length) return []
-        const messages = await Promise.all(
-            ids.map(async (id) => {
-                const raw = await this.redis.hget(this.roomMessageKey(roomId), String(id))
-                if (!raw) return null
-                return JSON.parse(raw) as Message
-            }),
-        )
-        return messages.filter(Boolean) as Message[]
+        const messages: Message[] = []
+        const key = this.roomMessageKey(roomId)
+        for (let offset = 0; offset < ids.length; offset += redisMessageReadBatchSize) {
+            const batchIds = ids.slice(offset, offset + redisMessageReadBatchSize)
+            const rawMessages = await this.redis.hmget(key, ...batchIds.map((id) => String(id)))
+            for (const raw of rawMessages) {
+                if (!raw) continue
+                messages.push(JSON.parse(raw) as Message)
+            }
+        }
+        return messages
     }
 
     private async getMessagesBySearchTimes(roomId: number, times: number[]): Promise<Message[]> {
@@ -452,15 +473,106 @@ export default class RedisStorageProvider implements StorageProvider {
      *
      * 在进入房间时，该方法被调用。
      */
-    async fetchMessages(roomId: number, skip: number, limit: number): Promise<Message[]> {
-        const msgKeys = await this.redis.zrevrange(`${this.qid}:msg${roomId}:msgIdList`, skip, skip + limit - 1)
-        const messagesPAry = msgKeys.map(async (key) => {
-            const msg = await this.redis.hget(`${this.qid}:msg${roomId}:messages`, key)
-            return JSON.parse(msg) as Message
+    private async getRoomPageIds(roomId: number, options: MessagePageOptions, limit: number): Promise<string[]> {
+        if (options?.before && options?.after) throw new Error('Message page cannot use before and after together')
+        const key = `${this.qid}:msg${roomId}:msgIdList`
+        const cursor = options?.before || options?.after
+        if (!cursor) return this.redis.zrevrangebyscore(key, '+inf', '-inf', 'LIMIT', 0, limit)
+
+        const cursorId = String(cursor.id)
+        if (options.after) {
+            const sameTime = (await this.redis.zrangebyscore(key, cursor.time, cursor.time)).filter(
+                (id) => String(id) > cursorId,
+            )
+            if (sameTime.length >= limit) return sameTime.slice(0, limit)
+            const newer = await this.redis.zrangebyscore(
+                key,
+                `(${cursor.time}`,
+                '+inf',
+                'LIMIT',
+                0,
+                limit - sameTime.length,
+            )
+            return [...sameTime, ...newer]
+        }
+
+        const sameTime = (await this.redis.zrevrangebyscore(key, cursor.time, cursor.time)).filter(
+            (id) => String(id) < cursorId,
+        )
+        if (sameTime.length >= limit) return sameTime.slice(0, limit)
+        const older = await this.redis.zrevrangebyscore(
+            key,
+            `(${cursor.time}`,
+            '-inf',
+            'LIMIT',
+            0,
+            limit - sameTime.length,
+        )
+        return [...sameTime, ...older]
+    }
+
+    private sortMessagesAscending(messages: Message[]): Message[] {
+        return messages.sort((left, right) => {
+            const timeDifference = Number(left.time || 0) - Number(right.time || 0)
+            if (timeDifference) return timeDifference
+            const leftId = String(left._id)
+            const rightId = String(right._id)
+            return leftId < rightId ? -1 : leftId > rightId ? 1 : 0
         })
-        const messages = (await Promise.all(messagesPAry)) as Message[]
-        messages.sort((a, b) => a.time - b.time)
-        return messages
+    }
+
+    async fetchMessages(roomId: number, options: MessagePageOptions, limit: number): Promise<Message[]> {
+        const msgKeys = await this.getRoomPageIds(roomId, options, limit)
+        return this.sortMessagesAscending(await this.getMessages(roomId, msgKeys))
+    }
+
+    private async resolveRecentMessageId(roomId: number, unreadCount: number, atOnly: boolean): Promise<string | null> {
+        let remaining = Math.max(0, Math.trunc(Number(unreadCount) || 0))
+        if (!remaining) return null
+
+        const listKey = this.roomMessageListKey(roomId)
+        const messageKey = this.roomMessageKey(roomId)
+        let offset = 0
+        while (remaining > 0) {
+            const batchSize = atOnly ? 100 : Math.min(redisMessageReadBatchSize, Math.max(100, remaining))
+            const ids = await this.redis.zrevrange(listKey, offset, offset + batchSize - 1)
+            if (!ids.length) return null
+            const rawMessages = await this.redis.hmget(messageKey, ...ids)
+
+            for (let index = 0; index < ids.length; index++) {
+                const rawMessage = rawMessages[index]
+                if (!rawMessage) continue
+                const message = JSON.parse(rawMessage) as Message
+                if (message.system) continue
+                remaining--
+                if ((!atOnly && remaining === 0) || (atOnly && message.at)) return String(ids[index])
+                if (remaining === 0) return null
+            }
+
+            if (ids.length < batchSize) return null
+            offset += ids.length
+        }
+        return null
+    }
+
+    async countUnreadMessagesFrom(roomId: number, messageId: string | number): Promise<number> {
+        const target = await this.getMessage(roomId, String(messageId))
+        if (!target) return 0
+
+        const targetTime = Number(target.time || 0)
+        const targetId = String(target._id)
+        const listKey = this.roomMessageListKey(roomId)
+        const [sameTimeIds, newerIds] = await Promise.all([
+            this.redis.zrangebyscore(listKey, targetTime, targetTime),
+            this.redis.zrangebyscore(listKey, `(${targetTime}`, '+inf'),
+        ])
+        const ids = [...sameTimeIds.filter((id) => String(id) >= targetId), ...newerIds]
+        const messages = await this.getMessages(roomId, ids)
+        return messages.filter((message) => !message.system).length
+    }
+
+    async resolveUnreadTargetMessageId(roomId: number, unreadCount: number): Promise<string | null> {
+        return this.resolveRecentMessageId(roomId, unreadCount, false)
     }
 
     /** 按发送者查询消息记录。
@@ -513,6 +625,9 @@ export default class RedisStorageProvider implements StorageProvider {
         keyword: string,
         skip: number,
         limit: number,
+        senderId?: string,
+        startTime?: number,
+        endTime?: number,
     ): Promise<Message[] | null> {
         if (!this.searchIndex.isReady) return null
         const normalized = normalizeSearchText(keyword)
@@ -520,13 +635,16 @@ export default class RedisStorageProvider implements StorageProvider {
         try {
             const result: Message[] = []
             let skipped = 0
-            let maxTime: number | undefined
+            let maxTime: number | undefined = endTime
+            const roomIds = roomId === 0 ? (await this.getSearchRooms()).map((room) => Number(room.roomId)) : [roomId]
             while (result.length < limit) {
-                const times = await this.searchIndex.searchTimes(normalized, { maxTime, limit: 256 })
+                const times = await this.searchIndex.searchTimes(normalized, {
+                    maxTime,
+                    minTime: startTime,
+                    limit: 256,
+                })
                 if (times === null) return null
                 if (!times.length) break
-                const roomIds =
-                    roomId === 0 ? (await this.getSearchRooms()).map((room) => Number(room.roomId)) : [roomId]
                 const messages = (
                     await Promise.all(
                         roomIds.map(async (rid) => {
@@ -536,7 +654,13 @@ export default class RedisStorageProvider implements StorageProvider {
                     )
                 )
                     .flat()
-                    .filter((message) => messageMatchesKeyword(message, normalized))
+                    .filter(
+                        (message) =>
+                            messageMatchesKeyword(message, normalized) &&
+                            (senderId === undefined || message.senderId === Number(senderId)) &&
+                            (startTime === undefined || Number(message.time || 0) >= startTime) &&
+                            (endTime === undefined || Number(message.time || 0) <= endTime),
+                    )
                 messages.sort((left, right) => {
                     const timeDifference = Number(right.time || 0) - Number(left.time || 0)
                     if (timeDifference) return timeDifference
@@ -560,26 +684,40 @@ export default class RedisStorageProvider implements StorageProvider {
         }
     }
 
-    async searchMessages(roomId: number, keyword: string, skip: number, limit: number): Promise<Message[]> {
+    async searchMessages(
+        roomId: number,
+        keyword: string,
+        skip: number,
+        limit: number,
+        senderId?: string,
+        startTime?: number,
+        endTime?: number,
+    ): Promise<Message[]> {
         const lowerKeyword = normalizeSearchText(keyword)
         if (lowerKeyword) {
-            const indexed = await this.searchMessagesFromSearchIndex(roomId, lowerKeyword, skip, limit)
+            const indexed = await this.searchMessagesFromSearchIndex(
+                roomId,
+                lowerKeyword,
+                skip,
+                limit,
+                senderId,
+                startTime,
+                endTime,
+            )
             if (indexed !== null) return indexed
         }
 
         const scanRoom = async (targetRoomId: number, includeRoomId: boolean): Promise<Message[]> => {
             const allMsgKeys = await this.redis.zrevrange(`${this.qid}:msg${targetRoomId}:msgIdList`, 0, -1)
-            const matched: Message[] = []
-            for (const key of allMsgKeys) {
-                const msg = await this.redis.hget(`${this.qid}:msg${targetRoomId}:messages`, key)
-                if (!msg) continue
-                const message = JSON.parse(msg) as Message
-                if (message.content && message.content.toLowerCase().includes(lowerKeyword)) {
-                    if (includeRoomId) message.roomId = targetRoomId
-                    matched.push(message)
-                }
-            }
-            return matched
+            const messages = await this.getMessages(targetRoomId, allMsgKeys)
+            return messages.filter((message) => {
+                if (!messageMatchesKeyword(message, lowerKeyword)) return false
+                if (senderId !== undefined && message.senderId !== Number(senderId)) return false
+                if (startTime !== undefined && Number(message.time || 0) < startTime) return false
+                if (endTime !== undefined && Number(message.time || 0) > endTime) return false
+                if (includeRoomId) message.roomId = targetRoomId
+                return true
+            })
         }
 
         const matched =
@@ -627,8 +765,24 @@ export default class RedisStorageProvider implements StorageProvider {
      * 在获取聊天历史消息时，该方法被调用。
      */
     async getMessage(roomId: number, messageId: string): Promise<Message> {
-        const msgString = await this.redis.hget(`${this.qid}:msg${roomId}:messages`, `${messageId}`)
-        return JSON.parse(msgString)
+        return this.findMessageRecord(roomId, messageId)
+    }
+
+    private async findMessageRecord(roomId: number, messageId: string): Promise<Message | null> {
+        const key = this.roomMessageKey(roomId)
+        const exactMessage = await this.redis.hget(key, `${messageId}`)
+        if (exactMessage) return JSON.parse(exactMessage) as Message
+
+        const time = messageIdTime(messageId)
+        if (time === null) return null
+        const targetTime = time * 1000
+        const ids = await this.redis.zrangebyscore(
+            this.roomMessageListKey(roomId),
+            targetTime - 2000,
+            targetTime + 2000,
+        )
+        const candidates = await this.getMessages(roomId, ids)
+        return candidates.find((candidate) => messageIdsEquivalent(candidate._id, messageId)) || null
     }
 
     /** 实现 {@link StorageProvider} 类的 `fetchMessagesAround` 方法，
@@ -637,34 +791,14 @@ export default class RedisStorageProvider implements StorageProvider {
      * 在定位到指定消息时，该方法被调用。
      */
     async fetchMessagesAround(roomId: number, messageId: string, before: number, after: number): Promise<Message[]> {
-        // 先获取目标消息
-        const targetMsgStr = await this.redis.hget(`${this.qid}:msg${roomId}:messages`, `${messageId}`)
-        if (!targetMsgStr) return []
-        const targetMsg = JSON.parse(targetMsgStr) as Message
-        const targetTime = targetMsg.time
-
-        // 获取所有消息 ID（按时间排序）
-        const allMsgKeys = await this.redis.zrangebyscore(`${this.qid}:msg${roomId}:msgIdList`, '-inf', '+inf')
-
-        // 找到目标消息的位置
-        const targetIndex = allMsgKeys.findIndex((key) => key === messageId)
-        if (targetIndex === -1) return []
-
-        // 计算范围
-        const startIndex = Math.max(0, targetIndex - before)
-        const endIndex = Math.min(allMsgKeys.length - 1, targetIndex + after)
-
-        // 获取范围内的消息
-        const messages: Message[] = []
-        for (let i = startIndex; i <= endIndex; i++) {
-            const msgStr = await this.redis.hget(`${this.qid}:msg${roomId}:messages`, allMsgKeys[i])
-            if (msgStr) {
-                messages.push(JSON.parse(msgStr) as Message)
-            }
-        }
-
-        messages.sort((a, b) => a.time - b.time)
-        return messages
+        const targetMsg = await this.findMessageRecord(roomId, messageId)
+        if (!targetMsg) return []
+        const cursor: MessageCursor = { time: Number(targetMsg.time || 0), id: targetMsg._id }
+        const [beforeMessages, afterMessages] = await Promise.all([
+            before > 0 ? this.fetchMessages(roomId, { before: cursor }, before) : Promise.resolve([]),
+            after > 0 ? this.fetchMessages(roomId, { after: cursor }, after) : Promise.resolve([]),
+        ])
+        return [...beforeMessages, targetMsg, ...afterMessages]
     }
 
     /** 实现 {@link StorageProvider} 类的 `addMessages` 方法，

@@ -9,6 +9,7 @@ import RoamingStamp from './RoamingStamp'
 import SearchableFriend from './SearchableFriend'
 import ChatGroup from './ChatGroup'
 import SpecialFeature from './SpecialFeature'
+import MessagePageOptions from './MessagePage'
 
 type CookiesDomain =
     | 'tenpay.com'
@@ -63,16 +64,25 @@ export default interface Adapter {
 
     getFriendsFallback(): Promise<SearchableFriend[]>
 
-    fetchMessages(roomId: number, offset: number): Promise<Message[]>
+    fetchMessages(roomId: number, options: MessagePageOptions): Promise<Message[]>
 
     fetchImageMessages(roomId: number, offset: number, endTime?: number): Promise<Message[]>
 
     fetchMessagesAround(roomId: number, messageId: string, before: number, after: number): Promise<Message[]>
 
+    resolveUnreadTargetMessageId(roomId: number, unreadCount: number): Promise<string | null>
+
     fetchMessagesBySender(roomId: number, senderId: number, offset: number): Promise<Message[]>
 
-    /** Use roomId 0 to search all conversations. */
-    searchMessages(roomId: number, keyword: string, offset: number): Promise<Message[]>
+    /** Use roomId 0 to search all conversations. Pass senderId to restrict results to one sender. */
+    searchMessages(
+        roomId: number,
+        keyword: string,
+        offset: number,
+        senderId?: number,
+        startTime?: number,
+        endTime?: number,
+    ): Promise<Message[]>
 
     isMessageSearchIndexReady?(): boolean
 
@@ -123,6 +133,8 @@ export default interface Adapter {
     clearCurrentRoomUnread(): any
 
     markRoomUnread(roomId: number): any
+
+    markMessageUnread(roomId: number, messageId: string): any
 
     setRoomPriority(roomId: number, priority: 1 | 2 | 3 | 4 | 5): any
 

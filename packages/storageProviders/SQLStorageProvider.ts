@@ -8,14 +8,22 @@ import Room from '@icalingua/types/Room'
 import ChatGroup from '@icalingua/types/ChatGroup'
 import { DBVersion, MessageInSQLDB } from '@icalingua/types/SQLTableTypes'
 import DatabaseUpgradeProgress from '@icalingua/types/DatabaseUpgradeProgress'
+import MessagePageOptions, { MessageCursor } from '@icalingua/types/MessagePage'
 import StorageProvider from '@icalingua/types/StorageProvider'
-import { escapeSearchLikePattern, messageMatchesKeyword, normalizeSearchText } from './MessageSearchIndex'
+import { escapeSearchLikePattern, normalizeSearchText } from './MessageSearchIndex'
+import { messageIdTime, messageIdsEquivalent } from './MessageId'
 import SQLiteMessageSearchIndexWorker from './SQLiteMessageSearchIndexWorker'
 import SQLStorageProviderWorker from './SQLStorageProviderWorker'
+import {
+    createSQLiteMessageSearchSourceCallbacks,
+    type SQLiteMessageSearchSourceRequest,
+    type SQLiteMessageSearchSourceResult,
+} from './SQLiteMessageSearchSource'
 import type {
     SQLiteMessageSearchIndexCallbacks,
     SQLiteMessageSearchTimesOptions,
     SQLiteSearchMessage,
+    SQLiteSearchTimeCount,
 } from './SQLiteMessageSearchIndex'
 import upg0to1 from './SQLUpgradeScript/0to1'
 import upg1to2 from './SQLUpgradeScript/1to2'
@@ -40,8 +48,9 @@ import upg19to20 from './SQLUpgradeScript/19to20'
 import upg20to21 from './SQLUpgradeScript/20to21'
 import upg21to22 from './SQLUpgradeScript/21to22'
 import upg22to23 from './SQLUpgradeScript/22to23'
+import upg23to24 from './SQLUpgradeScript/23to24'
 
-const dbVersionLatest = 23
+const dbVersionLatest = 24
 
 const normalizeRoomId = (roomId: unknown): string => {
     const value = String(roomId || 0) || '0'
@@ -87,6 +96,13 @@ export type MessageSearchIndexFactory = (
 const createMessageSearchIndexWorker: MessageSearchIndexFactory = (filePath, callbacks, errorHandle) =>
     new SQLiteMessageSearchIndexWorker(filePath, callbacks, errorHandle)
 
+// Move larger pages across the Worker boundary, then split the source lookup
+// below the conservative 900-parameter budget used by WHERE IN. FTS writes are
+// still independently chunked by SQLiteMessageSearchIndex.
+const sqlSearchReadBatchSize = 800
+const sqlSearchBuildBatchSize = 4000
+const sqlSearchValidationBatchSize = 4000
+
 export default class SQLStorageProvider implements StorageProvider {
     id: string
     type: 'pg' | 'mysql' | 'sqlite3'
@@ -104,6 +120,7 @@ export default class SQLStorageProvider implements StorageProvider {
         connectOpt: PgMyOpt | SQLiteOpt,
         errorHandle: Function = console.error,
         searchIndexFactory?: MessageSearchIndexFactory,
+        sqliteReadOnly = false,
     ) {
         if (type === 'sqlite3' && !searchIndexFactory) {
             return new SQLStorageProviderWorker(
@@ -143,15 +160,15 @@ export default class SQLStorageProvider implements StorageProvider {
                         max: 1,
                         afterCreate: (conn: any, done: any) => {
                             try {
-                                conn.exec(
-                                    [
-                                        'PRAGMA journal_mode = WAL', // 读写并发，不阻塞
-                                        'PRAGMA busy_timeout = 5000', // 写入遇锁等待 5 秒
-                                        'PRAGMA synchronous = NORMAL', // WAL 下 NORMAL 就够安全，比 FULL 快一倍写入
-                                        'PRAGMA cache_size = -16384', // 16MB 页缓存，加速大量消息的查询
-                                        'PRAGMA mmap_size = 67108864', // 64MB 内存映射，减少磁盘 I/O
-                                    ].join('; '),
-                                )
+                                const pragmas = [
+                                    ...(sqliteReadOnly ? [] : ['PRAGMA journal_mode = WAL']), // 读写并发，不阻塞
+                                    'PRAGMA busy_timeout = 5000', // 写入遇锁等待 5 秒
+                                    'PRAGMA synchronous = NORMAL', // WAL 下 NORMAL 就够安全，比 FULL 快一倍写入
+                                    'PRAGMA cache_size = -16384', // 16MB 页缓存，加速大量消息的查询
+                                    'PRAGMA mmap_size = 67108864', // 64MB 内存映射，减少磁盘 I/O
+                                    ...(sqliteReadOnly ? ['PRAGMA query_only = ON'] : []),
+                                ]
+                                conn.exec(pragmas.join('; '))
                                 done(null, conn)
                             } catch (error) {
                                 done(error, conn)
@@ -186,11 +203,10 @@ export default class SQLStorageProvider implements StorageProvider {
         this.searchIndex = (searchIndexFactory || createMessageSearchIndexWorker)(
             searchDbPath,
             {
-                loadTimes: (afterTime, limit) => this.loadSearchTimes(afterTime, limit),
-                loadMessagesByTimes: (times) => this.loadSearchMessagesByTimes(times),
-                loadMessageTimeCounts: (afterTime, limit) => this.loadSearchTimeCounts(afterTime, limit),
-                countMessages: () => this.countSearchMessages(),
+                ...createSQLiteMessageSearchSourceCallbacks((request) => this.readMessageSearchSource(request)),
                 reportProgress: (progress) => this.reportUpgradeProgress(progress),
+                buildBatchSize: sqlSearchBuildBatchSize,
+                validationBatchSize: sqlSearchValidationBatchSize,
             },
             this.errorHandle as (error: unknown) => void,
         )
@@ -438,6 +454,9 @@ export default class SQLStorageProvider implements StorageProvider {
                 case 22:
                     report('升级数据库 v22 → v23')
                     await upg22to23(this.db)
+                case 23:
+                    report('升级数据库 v23 → v24')
+                    await upg23to24(this.db)
                 default:
                     break
             }
@@ -458,13 +477,19 @@ export default class SQLStorageProvider implements StorageProvider {
 
     private async loadSearchMessagesByTimes(times: number[]): Promise<SQLiteSearchMessage[]> {
         if (!times.length) return []
-        return this.db<MessageInSQLDB>('messages')
-            .select('time', 'content')
-            .whereIn('time', times)
-            .where('time', '>', 0)
+        const messages: SQLiteSearchMessage[] = []
+        for (const batchTimes of lodash.chunk(times, sqlSearchReadBatchSize)) {
+            messages.push(
+                ...(await this.db<MessageInSQLDB>('messages')
+                    .select('time', 'content')
+                    .whereIn('time', batchTimes)
+                    .where('time', '>', 0)),
+            )
+        }
+        return messages
     }
 
-    private async loadSearchTimeCounts(afterTime: number, limit: number) {
+    private async loadSearchTimeCounts(afterTime: number, limit: number): Promise<SQLiteSearchTimeCount[]> {
         const rows = await this.db('messages')
             .select('time')
             .count({ messageCount: '*' })
@@ -483,6 +508,20 @@ export default class SQLStorageProvider implements StorageProvider {
         return Number(result?.count || Object.values(result || {})[0] || 0)
     }
 
+    /** Internal Worker RPC used only to feed the disposable SQLite FTS sidecar. */
+    async readMessageSearchSource(request: SQLiteMessageSearchSourceRequest): Promise<SQLiteMessageSearchSourceResult> {
+        switch (request.operation) {
+            case 'loadTimes':
+                return this.loadSearchTimes(request.afterTime, request.limit)
+            case 'loadMessagesByTimes':
+                return this.loadSearchMessagesByTimes(request.times)
+            case 'loadMessageTimeCounts':
+                return this.loadSearchTimeCounts(request.afterTime, request.limit)
+            case 'countMessages':
+                return this.countSearchMessages()
+        }
+    }
+
     private async ensureMessageSearchSchema(): Promise<void> {
         await this.searchIndex.open()
     }
@@ -493,6 +532,10 @@ export default class SQLStorageProvider implements StorageProvider {
 
     async validateMessageSearchIndex(): Promise<void> {
         await this.searchIndex?.validate()
+    }
+
+    async searchMessageTimes(keyword: string, options: SQLiteMessageSearchTimesOptions): Promise<number[] | null> {
+        return (await this.searchIndex?.searchTimes(keyword, options)) ?? null
     }
 
     /** 实现 {@link StorageProvider} 类的 connect 方法。
@@ -539,6 +582,7 @@ export default class SQLStorageProvider implements StorageProvider {
                     table.text('users')
                     table.text('lastMessage')
                     table.string('at').nullable()
+                    table.string('atMessageId').nullable()
                     table.boolean('autoDownload').nullable()
                     table.string('downloadPath').nullable()
                     table.index(['unreadCount', 'priority', 'utime'])
@@ -906,17 +950,69 @@ export default class SQLStorageProvider implements StorageProvider {
      *
      * 在进入房间时，该方法被调用。
      */
-    async fetchMessages(roomId: number, skip: number, limit: number): Promise<Message[]> {
+    private applyMessageCursor(query: any, options: MessagePageOptions) {
+        if (options?.before && options?.after) throw new Error('Message page cannot use before and after together')
+        const cursor = options?.before || options?.after
+        if (!cursor) return query
+        const operator = options.after ? '>' : '<'
+        return query.whereRaw(`(??, ??) ${operator} (?, ?)`, ['time', '_id', cursor.time, String(cursor.id)])
+    }
+
+    private orderMessagePage(query: any, options: MessagePageOptions) {
+        const direction = options?.after ? 'asc' : 'desc'
+        return query.orderBy('time', direction).orderBy('_id', direction)
+    }
+
+    async fetchMessages(roomId: number, options: MessagePageOptions, limit: number): Promise<Message[]> {
         try {
-            const messages = await this.db<MessageInSQLDB>('messages')
-                .where('roomId', roomId)
-                .orderBy('time', 'desc')
-                .limit(limit)
-                .offset(skip)
-                .select('*')
-            return messages.reverse().map((message) => this.msgConFromDB(message))
+            let query = this.db<MessageInSQLDB>('messages').where('roomId', roomId)
+            query = this.applyMessageCursor(query, options)
+            const messages = await this.orderMessagePage(query, options).limit(limit).select('*')
+            if (!options?.after) messages.reverse()
+            return messages.map((message) => this.msgConFromDB(message))
         } catch (e) {
             this.errorHandle(e)
+        }
+    }
+
+    async countUnreadMessagesFrom(roomId: number, messageId: string | number): Promise<number> {
+        try {
+            const target = await this.getMessage(roomId, String(messageId))
+            if (!target) return 0
+
+            const targetTime = Number(target.time || 0)
+            const targetId = String(target._id)
+            const result = await this.db<MessageInSQLDB>('messages')
+                .where('roomId', roomId)
+                .where((builder) => builder.whereNull('system').orWhere('system', false))
+                .andWhereRaw('(??, ??) >= (?, ?)', ['time', '_id', targetTime, targetId])
+                .count({ count: '*' })
+                .first()
+            return Number(result?.count || 0)
+        } catch (e) {
+            this.errorHandle(e)
+            return 0
+        }
+    }
+
+    async resolveUnreadTargetMessageId(roomId: number, unreadCount: number): Promise<string | null> {
+        try {
+            const count = Math.max(0, Math.trunc(Number(unreadCount) || 0))
+            if (!count) return null
+
+            let query = this.db<MessageInSQLDB>('messages')
+                .where('roomId', roomId)
+                .where((builder) => builder.whereNull('system').orWhere('system', false))
+            query = this.orderMessagePage(query, {})
+
+            const target = await query
+                .offset(count - 1)
+                .select('_id')
+                .first()
+            return target?._id === undefined || target?._id === null ? null : String(target._id)
+        } catch (e) {
+            this.errorHandle(e)
+            return null
         }
     }
 
@@ -958,6 +1054,9 @@ export default class SQLStorageProvider implements StorageProvider {
         keyword: string,
         skip: number,
         limit: number,
+        senderId?: string,
+        startTime?: number,
+        endTime?: number,
     ): Promise<Message[] | null> {
         if (!this.searchIndex.isReady) return null
         const normalized = normalizeSearchText(keyword)
@@ -965,17 +1064,21 @@ export default class SQLStorageProvider implements StorageProvider {
 
         const result: Message[] = []
         let skipped = 0
-        let maxTime: number | undefined
+        let maxTime: number | undefined = endTime
         while (result.length < limit) {
-            const times = await this.searchIndex.searchTimes(normalized, { maxTime, limit: 256 })
+            const times = await this.searchIndex.searchTimes(normalized, { maxTime, minTime: startTime, limit: 256 })
             if (times === null) return null
             if (!times.length) break
 
             let query = this.db<MessageInSQLDB>('messages').whereIn('time', times)
             if (roomId !== 0) query = query.where('roomId', roomId)
+            if (senderId !== undefined) query = query.where('senderId', senderId)
+            if (startTime !== undefined) query = query.where('time', '>=', startTime)
+            if (endTime !== undefined) query = query.where('time', '<=', endTime)
+            const escapedKeyword = escapeSearchLikePattern(normalized)
+            query = query.whereRaw("LOWER(COALESCE(content, '')) LIKE ? ESCAPE '!'", [`%${escapedKeyword}%`])
             const messages = await query.orderBy('time', 'desc').select('*')
             for (const message of messages) {
-                if (!messageMatchesKeyword(message, normalized)) continue
                 if (skipped < skip) {
                     skipped++
                     continue
@@ -1001,11 +1104,27 @@ export default class SQLStorageProvider implements StorageProvider {
      * @param skip 跳过条数
      * @param limit 返回条数
      */
-    async searchMessages(roomId: number, keyword: string, skip: number, limit: number): Promise<Message[]> {
+    async searchMessages(
+        roomId: number,
+        keyword: string,
+        skip: number,
+        limit: number,
+        senderId?: string,
+        startTime?: number,
+        endTime?: number,
+    ): Promise<Message[]> {
         try {
             const normalized = normalizeSearchText(keyword)
             if (normalized) {
-                const indexed = await this.searchMessagesFromSearchIndex(roomId, normalized, skip, limit)
+                const indexed = await this.searchMessagesFromSearchIndex(
+                    roomId,
+                    normalized,
+                    skip,
+                    limit,
+                    senderId,
+                    startTime,
+                    endTime,
+                )
                 if (indexed !== null) return indexed
             }
 
@@ -1015,6 +1134,9 @@ export default class SQLStorageProvider implements StorageProvider {
                 query = query.whereRaw("LOWER(COALESCE(content, '')) LIKE ? ESCAPE '!'", [`%${escapedKeyword}%`])
             }
             if (roomId !== 0) query = query.where('roomId', roomId)
+            if (senderId !== undefined) query = query.where('senderId', senderId)
+            if (startTime !== undefined) query = query.where('time', '>=', startTime)
+            if (endTime !== undefined) query = query.where('time', '<=', endTime)
             const messages = await query.orderBy('time', 'desc').limit(limit).offset(skip).select('*')
             return messages.map((message) => {
                 const messageRoomId = Number(message.roomId)
@@ -1053,14 +1175,28 @@ export default class SQLStorageProvider implements StorageProvider {
      *
      * 在获取聊天历史消息时，该方法被调用。
      */
+    private async findMessageRecord(roomId: number, messageId: string): Promise<MessageInSQLDB> {
+        const exactMessage = await this.db<MessageInSQLDB>('messages')
+            .where('_id', messageId)
+            .where('roomId', roomId)
+            .select('*')
+            .first()
+        if (exactMessage) return exactMessage
+
+        const time = messageIdTime(messageId)
+        if (time === null) return null
+        const targetTime = time * 1000
+        const candidates = await this.db<MessageInSQLDB>('messages')
+            .where('roomId', roomId)
+            .whereBetween('time', [targetTime - 2000, targetTime + 2000])
+            .select('*')
+        return candidates.find((candidate) => messageIdsEquivalent(candidate._id, messageId)) || null
+    }
+
     async getMessage(roomId: number, messageId: string): Promise<Message> {
         try {
-            const message = await this.db<MessageInSQLDB>('messages')
-                .where('_id', messageId)
-                .where('roomId', roomId)
-                .select('*')
-            if (message.length === 0) return null
-            return this.msgConFromDB(message[0])
+            const message = await this.findMessageRecord(roomId, messageId)
+            return message ? this.msgConFromDB(message) : null
         } catch (e) {
             this.errorHandle(e)
         }
@@ -1073,35 +1209,15 @@ export default class SQLStorageProvider implements StorageProvider {
      */
     async fetchMessagesAround(roomId: number, messageId: string, before: number, after: number): Promise<Message[]> {
         try {
-            // 先获取目标消息的时间
-            const targetMsg = await this.db<MessageInSQLDB>('messages')
-                .where('_id', messageId)
-                .where('roomId', roomId)
-                .select('time')
-                .first()
+            const targetMsg = await this.findMessageRecord(roomId, messageId)
             if (!targetMsg) return []
 
-            const targetTime = targetMsg.time
-
-            // 获取目标消息之前的消息（时间小于等于目标时间，按时间倒序取 before 条）
-            const beforeMessages = await this.db<MessageInSQLDB>('messages')
-                .where('roomId', roomId)
-                .where('time', '<', targetTime)
-                .orderBy('time', 'desc')
-                .limit(before)
-                .select('*')
-
-            // 获取目标消息及之后的消息（时间大于等于目标时间，按时间正序取 after + 1 条）
-            const afterMessages = await this.db<MessageInSQLDB>('messages')
-                .where('roomId', roomId)
-                .where('time', '>=', targetTime)
-                .orderBy('time', 'asc')
-                .limit(after + 1)
-                .select('*')
-
-            // 合并并按时间排序
-            const allMessages = [...beforeMessages.reverse(), ...afterMessages]
-            return allMessages.map((message) => this.msgConFromDB(message))
+            const cursor: MessageCursor = { time: Number(targetMsg.time || 0), id: targetMsg._id }
+            const [beforeMessages, afterMessages] = await Promise.all([
+                before > 0 ? this.fetchMessages(roomId, { before: cursor }, before) : Promise.resolve([]),
+                after > 0 ? this.fetchMessages(roomId, { after: cursor }, after) : Promise.resolve([]),
+            ])
+            return [...beforeMessages, this.msgConFromDB(targetMsg), ...afterMessages]
         } catch (e) {
             this.errorHandle(e)
         }

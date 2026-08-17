@@ -5,6 +5,7 @@ import Adapter, { CookiesDomain } from '@icalingua/types/Adapter'
 import IgnoreChatInfo from '@icalingua/types/IgnoreChatInfo'
 import LoginForm from '@icalingua/types/LoginForm'
 import Message from '@icalingua/types/Message'
+import MessagePageOptions from '@icalingua/types/MessagePage'
 import RoamingStamp from '@icalingua/types/RoamingStamp'
 import Room from '@icalingua/types/Room'
 import SearchableFriend from '@icalingua/types/SearchableFriend'
@@ -282,16 +283,16 @@ const adapter: Adapter = {
         }
     },
 
-    async fetchMessages(roomId: number, offset: number): Promise<Message[]> {
+    async fetchMessages(roomId: number, options: MessagePageOptions): Promise<Message[]> {
         // 只读模式始终禁言
-        if (!offset) {
+        if (!options?.before && !options?.after) {
             ui.setShutUp(true)
         }
 
         // 刷新 rkey（如果需要）
         await refreshRkeyIfNeeded()
 
-        const messages = (await storage.fetchMessages(roomId, offset, 20)) || []
+        const messages = (await storage.fetchMessages(roomId, options || {}, 20)) || []
 
         // 替换消息中的 rkey
         for (const message of messages) {
@@ -308,9 +309,25 @@ const adapter: Adapter = {
         }
         return messages
     },
-    async searchMessages(roomId: number, keyword: string, offset: number): Promise<Message[]> {
+    async searchMessages(
+        roomId: number,
+        keyword: string,
+        offset: number,
+        senderId?: number,
+        startTime?: number,
+        endTime?: number,
+    ): Promise<Message[]> {
         await refreshRkeyIfNeeded()
-        const messages = (await storage.searchMessages(roomId, keyword, offset, 20)) || []
+        const messages =
+            (await storage.searchMessages(
+                roomId,
+                keyword,
+                offset,
+                20,
+                senderId === undefined ? undefined : String(senderId),
+                startTime,
+                endTime,
+            )) || []
         for (const message of messages) {
             processMessageRkey(message)
         }
@@ -343,6 +360,10 @@ const adapter: Adapter = {
         }
 
         return messages
+    },
+
+    resolveUnreadTargetMessageId(roomId: number, unreadCount: number): Promise<string | null> {
+        return storage.resolveUnreadTargetMessageId(roomId, unreadCount)
     },
 
     async getRoom(roomId: number): Promise<Room> {
@@ -504,7 +525,21 @@ const adapter: Adapter = {
         if (!room) return
         room.unreadCount = Math.max(room.unreadCount || 0, 1)
         room.at = false
-        await storage.updateRoom(roomId, { unreadCount: room.unreadCount, at: false })
+        room.atMessageId = null
+        await storage.updateRoom(roomId, { unreadCount: room.unreadCount, at: false, atMessageId: null })
+        ui.updateRoom(room)
+        await updateTrayIcon()
+    },
+
+    async markMessageUnread(roomId: number, messageId: string): Promise<void> {
+        const room = await storage.getRoom(roomId)
+        if (!room) return
+        const unreadCount = await storage.countUnreadMessagesFrom(roomId, messageId)
+        if (!unreadCount) return
+        room.unreadCount = unreadCount
+        room.at = false
+        room.atMessageId = null
+        await storage.updateRoom(roomId, { unreadCount, at: false, atMessageId: null })
         ui.updateRoom(room)
         await updateTrayIcon()
     },

@@ -31,6 +31,7 @@ import {
     showDeviceManagerWindow,
     showRequestWindow,
     showSetLockPasswordWindow,
+    tryToShowMainWindow,
 } from '../utils/windowManager'
 import {
     deleteMessage,
@@ -49,6 +50,7 @@ import {
     ignoreChat,
     makeForward,
     markRoomUnread,
+    markMessageUnread,
     pinRoom,
     removeChat,
     renewMessage,
@@ -176,7 +178,7 @@ const openMemberHistoryWindow = (senderId: number, roomId: number, senderName: s
     })
 }
 
-const openMessageSearchWindow = (roomId: number, roomName: string) => {
+const openMessageSearchWindow = (roomId: number, roomName: string, senderId?: number, senderName?: string) => {
     const size = screen.getPrimaryDisplay().size
     let width = size.width - 300
     if (width > 1440) width = 900
@@ -199,9 +201,45 @@ const openMessageSearchWindow = (roomId: number, roomName: string) => {
             shell.openExternal(details.url)
             return { action: 'deny' }
         })
-        win.webContents.send('initMessageSearch', { roomId, roomName })
+        win.webContents.send('initMessageSearch', { roomId, roomName, senderId, senderName })
     })
 }
+
+const openSenderMessageSearchWindow = async (senderId: number, senderName: string, roomId: number) => {
+    let roomName = '全部会话'
+    if (roomId !== 0) {
+        try {
+            const room = await getRoom(roomId)
+            roomName = room
+                ? roomId < 0 && getConfig().removeGroupNameEmotes
+                    ? removeGroupNameEmotes(room.roomName)
+                    : room.roomName
+                : `${roomId < 0 ? '群聊' : '私聊'} ${Math.abs(roomId)}`
+        } catch (e) {
+            roomName = `${roomId < 0 ? '群聊' : '私聊'} ${Math.abs(roomId)}`
+        }
+    }
+    openMessageSearchWindow(roomId, roomName, senderId, senderName)
+}
+
+const createSenderMessageSearchMenu = (senderId: number, senderName: string, roomId?: number) =>
+    new MenuItem({
+        label: '搜索 TA 的消息',
+        submenu: Menu.buildFromTemplate([
+            ...(roomId
+                ? [
+                      {
+                          label: '当前会话',
+                          click: () => openSenderMessageSearchWindow(senderId, senderName, roomId),
+                      },
+                  ]
+                : []),
+            {
+                label: '全部会话',
+                click: () => openSenderMessageSearchWindow(senderId, senderName, 0),
+            },
+        ]),
+    })
 
 {
     const initMenu = Menu.buildFromTemplate([
@@ -357,6 +395,7 @@ const buildRoomMenu = async (room: Room): Promise<Menu> => {
                 openMessageSearchWindow(room.roomId, roomName)
             },
         },
+        ...(room.roomId > 0 ? [createSenderMessageSearchMenu(room.roomId, room.roomName, room.roomId)] : []),
         {
             label: `复制${avatarType} URL`,
             click: () => {
@@ -644,8 +683,11 @@ const buildRoomMenu = async (room: Room): Promise<Menu> => {
         menu.append(
             new MenuItem({
                 label: '全员禁言',
-                visible: (await isAdmin(room.roomId)) !== false,
                 async click() {
+                    if ((await isAdmin(room.roomId)) === false) {
+                        ui.messageError('您不是本群管理员，无法操作')
+                        return
+                    }
                     const win = newIcalinguaWindow({
                         height: 210,
                         width: 600,
@@ -1488,6 +1530,16 @@ export const updateAppMenu = async () => {
                         },
                     },
                     {
+                        label: '未读统计 @全体',
+                        type: 'checkbox',
+                        checked: getConfig().countAtAllInChatGroups,
+                        click: (menuItem) => {
+                            getConfig().countAtAllInChatGroups = menuItem.checked
+                            saveConfigFile()
+                            ui.setCountAtAllInChatGroups(menuItem.checked)
+                        },
+                    },
+                    {
                         label: '启用高亮 URL 功能',
                         type: 'checkbox',
                         checked: getConfig().linkify,
@@ -2275,6 +2327,14 @@ ipcMain.on('popupMessageMenu', async (event, e, room: Room, message: Message, se
                 },
             }),
         )
+        if (!history && !message.system) {
+            menu.append(
+                new MenuItem({
+                    label: '标记为未读',
+                    click: () => markMessageUnread(room.roomId, String(message._id)),
+                }),
+            )
+        }
         if (
             (message.senderId === getUin() || ((await isAdmin()) && message.role !== 'owner')) &&
             !history &&
@@ -2400,6 +2460,15 @@ ipcMain.on('popupMessageMenu', async (event, e, room: Room, message: Message, se
             ) {
                 menu.append(
                     new MenuItem({
+                        label: '转发',
+                        visible: win === getMainWindow(),
+                        click: () => {
+                            ui.forwardSingleMessage(message._id as string)
+                        },
+                    }),
+                )
+                menu.append(
+                    new MenuItem({
                         label: `+1${message.code ? ' (普通消息)' : ''}`,
                         click: () => {
                             let messageType
@@ -2454,15 +2523,6 @@ ipcMain.on('popupMessageMenu', async (event, e, room: Room, message: Message, se
                                 for (const url of imageUrls) ui.pasteGif(url)
                                 ui.replyMessage(message.replyMessage)
                             }
-                        },
-                    }),
-                )
-                menu.append(
-                    new MenuItem({
-                        label: '转发',
-                        visible: win === getMainWindow(),
-                        click: () => {
-                            ui.forwardSingleMessage(message._id as string)
                         },
                     }),
                 )
@@ -2805,6 +2865,7 @@ ipcMain.on('popupAvatarMenu', async (event, message: Message, room: Room, ev) =>
             ]),
         }),
     )
+    menu.append(createSenderMessageSearchMenu(message.senderId, message.username, room.roomId))
     menu.append(
         new MenuItem({
             label: `屏蔽此人`,
@@ -2962,6 +3023,7 @@ ipcMain.on(
                         },
                     }),
                 )
+                menu.append(createSenderMessageSearchMenu(displayId, remark || name || String(displayId), displayId))
             }
         }
         menu.append(
@@ -3146,6 +3208,13 @@ ipcMain.on(
                     ]),
                 }),
             )
+            menu.append(
+                createSenderMessageSearchMenu(
+                    displayId,
+                    remark || name || String(displayId),
+                    group ? -Number(group) : undefined,
+                ),
+            )
         }
         menu.append(
             new MenuItem({
@@ -3264,8 +3333,8 @@ ipcMain.on('gotoMessage', async (_, roomId: number, messageId: string) => {
     const selectedRoom = await getSelectedRoom()
 
     if (selectedRoom && selectedRoom.roomId === roomId) {
-        // 当前房间已打开，直接在主窗口定位
-        ui.gotoMessage(roomId, messageId)
+        // 当前房间已打开，唤回主窗口后定位
+        tryToShowMainWindow(() => ui.gotoMessage(roomId, messageId))
     } else {
         // 打开新窗口并定位到消息
         const { openChatWindow } = await import('../utils/windowManager')

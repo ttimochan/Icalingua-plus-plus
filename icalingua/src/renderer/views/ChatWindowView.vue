@@ -15,7 +15,9 @@
                     :messages-loaded="messagesLoaded"
                     :show-audio="true"
                     :show-reaction-emojis="false"
-                    :show-new-messages-divider="false"
+                    :show-new-messages-divider="!isInMiddle"
+                    :unread-divider-count="unreadDividerCount"
+                    :unread-divider-target-id="unreadDividerTargetId"
                     :load-first-room="true"
                     :accepted-files="'*'"
                     :message-actions="[]"
@@ -33,14 +35,15 @@
                     :linkify="linkify"
                     :account="account"
                     :username="username"
-                    :last-unread-count="0"
-                    :last-unread-at="false"
+                    :last-unread-count="lastUnreadCount"
+                    :last-unread-at="lastUnreadAt"
                     :showSinglePanel="false"
                     :removeHeaderEmotes="roomId < 0 && removeGroupNameEmotes"
                     :usePanguJsRecv="usePanguJsRecv"
                     :isSteamVrRunning="false"
                     :window-drag-enabled="hideTitleBar"
                     :canLoadAfter="isInMiddle"
+                    :pending-messages-count="deferredIncomingMessages.length"
                     :standalone="true"
                     @send-message="sendMessage"
                     @open-file="openImage"
@@ -52,7 +55,12 @@
                     @open-forward="openForward"
                     @open-choose-file-type="openChooseFileType"
                     @fetch-messages="fetchMessage"
+                    @locate-message="locateMessage"
+                    @locate-unread-message="locateUnreadMessage"
+                    @clear-last-unread-count="clearLastUnreadCount"
+                    @clear-last-unread-at="clearLastUnreadAt"
                     @fetch-messages-after="fetchMessageAfter"
+                    @return-to-latest="returnToLatest"
                 >
                     <template v-slot:menu-icon>
                         <i class="el-icon-more"></i>
@@ -77,44 +85,40 @@
             </div>
             <template v-if="stickerPanelBottom">
                 <div class="sticker-bottom-resizer" v-show="panel" @mousedown="startStickerHeightResize"></div>
-                <transition name="vac-fade-stickers">
+                <transition name="vac-stickers-panel-bottom">
                     <div
                         v-show="panel"
                         class="panel-bottom"
                         :style="{ height: stickerPanelHeight + 'px' }"
                         ref="stickerPanel"
                     >
-                        <transition name="vac-fade-stickers">
-                            <Stickers
-                                v-show="panel === 'stickers'"
-                                :open="panel === 'stickers'"
-                                :bottomMode="true"
-                                @send="sendSticker"
-                                @close="panel = ''"
-                                @selectEmoji="
-                                    $refs.room.useMessageContent($event.data)
-                                    $refs.room.focusTextarea()
-                                "
-                                @selectFace="
-                                    $refs.room.useMessageContent(`[Face: ${$event}]`)
-                                    $refs.room.focusTextarea()
-                                "
-                                @sendLottie="sendLottie"
-                            />
-                        </transition>
+                        <Stickers
+                            :open="panel === 'stickers'"
+                            :bottomMode="true"
+                            @send="sendSticker"
+                            @close="panel = ''"
+                            @selectEmoji="
+                                $refs.room.useMessageContent($event.data)
+                                $refs.room.focusTextarea()
+                            "
+                            @selectFace="
+                                $refs.room.useMessageContent(`[Face: ${$event}]`)
+                                $refs.room.focusTextarea()
+                            "
+                            @sendLottie="sendLottie"
+                        />
                     </div>
                 </transition>
             </template>
-            <transition name="vac-fade-stickers" v-else>
-                <div
-                    :style="{ minWidth: '300px', width: '320px', maxWidth: '500px' }"
-                    v-show="panel"
-                    class="panel-right"
-                    ref="stickerPanel"
-                >
-                    <transition name="vac-fade-stickers">
+            <template v-else>
+                <transition name="vac-stickers-panel-side">
+                    <div
+                        :style="{ minWidth: '300px', width: '320px', maxWidth: '500px' }"
+                        v-show="panel"
+                        class="panel-right"
+                        ref="stickerPanel"
+                    >
                         <Stickers
-                            v-show="panel === 'stickers'"
                             :open="panel === 'stickers'"
                             @send="sendSticker"
                             @close="panel = ''"
@@ -128,9 +132,9 @@
                             "
                             @sendLottie="sendLottie"
                         />
-                    </transition>
-                </div>
-            </transition>
+                    </div>
+                </transition>
+            </template>
         </div>
         <el-dialog
             :title="tempFileName"
@@ -152,7 +156,17 @@ import Stickers from '../components/Stickers.vue'
 import { ipcRenderer } from 'electron'
 import ipc from '../utils/ipc'
 import { processFiles } from '../utils/processFiles'
+import { createRendererLifecycleScope } from '../utils/rendererLifecycleScope'
+import {
+    compareMessageOrder,
+    getMessageCursor,
+    mergeMessageLists,
+    messageIdKey,
+    normalizeMessageList,
+} from '../utils/messageOrder'
 import '../utils/themes'
+
+const NEARBY_MESSAGE_LOAD_LIMIT = 100
 
 export default {
     name: 'ChatWindowView',
@@ -171,6 +185,16 @@ export default {
                 lastMessage: {},
             },
             messages: [],
+            deferredIncomingMessages: [],
+            deferredIncomingIds: new Set(),
+            messageLoadGeneration: 0,
+            lastUnreadCount: 0,
+            lastUnreadCheck: 0,
+            lastUnreadAt: false,
+            lastUnreadAtMessageId: null,
+            lastUnreadCheck2: 0,
+            unreadDividerCount: 0,
+            unreadDividerTargetId: null,
             messagesLoaded: false,
             dbUpgrade: { active: false, step: 0, total: 0, message: '' },
             loading: true,
@@ -199,26 +223,50 @@ export default {
             // 底部模式下面板嵌入窗口内部，不再扩展窗口宽度
             if (this.stickerPanelBottom) return
             if (val && !oldVal) {
-                // 面板打开：等渲染完成后测量实际宽度再扩展窗口
+                // 面板打开：等渲染完成后读取内联宽度再扩展窗口，避免被 enter 状态的 0 宽度影响
                 this.$nextTick(() => {
+                    if (!this.panel || this.stickerPanelWidth > 0) return
                     const el = this.$refs.stickerPanel
                     if (el) {
-                        this.stickerPanelWidth = el.offsetWidth
-                        ipcRenderer.send('resizeChatWindow', this.stickerPanelWidth)
+                        const width = Number.parseFloat(el.style.width) || el.offsetWidth
+                        if (width > 0) {
+                            this.stickerPanelWidth = width
+                            ipcRenderer.send('resizeChatWindow', width)
+                        }
                     }
                 })
             } else if (!val && oldVal) {
-                // 面板关闭：缩回窗口
+                // 独立窗口右侧模式不使用动画，关闭时立即缩回窗口
                 if (this.stickerPanelWidth > 0) {
                     ipcRenderer.send('resizeChatWindow', -this.stickerPanelWidth)
                     this.stickerPanelWidth = 0
                 }
             }
         },
+        lastUnreadCount(n) {
+            if (n !== 0) {
+                if (this.lastUnreadCheck) this.lifecycleScope.cancelTimeout(this.lastUnreadCheck)
+                this.lastUnreadCheck = this.lifecycleScope.timeout(() => {
+                    this.lastUnreadCount = 0
+                }, 30000)
+            }
+        },
+        lastUnreadAt(n) {
+            if (n) {
+                if (this.lastUnreadCheck2) this.lifecycleScope.cancelTimeout(this.lastUnreadCheck2)
+                this.lastUnreadCheck2 = this.lifecycleScope.timeout(() => {
+                    this.lastUnreadAt = false
+                    this.lastUnreadAtMessageId = null
+                }, 30000)
+            }
+        },
     },
     async created() {
+        this.lifecycleScope = createRendererLifecycleScope()
         // 从路由参数获取 roomId
         this.roomId = parseInt(this.$route.params.roomId)
+        // 在首次 await 前注册，避免主进程的定位事件先于异步初始化到达。
+        this.setupIpcListeners()
         this.dbUpgrade = await ipc.getDbUpgradeProgress()
 
         // 获取设置
@@ -239,6 +287,12 @@ export default {
         // 获取房间信息
         const roomInfo = await ipc.getRoomInfo(this.roomId)
         if (roomInfo) {
+            const unreadCount = Math.max(Number(roomInfo.unreadCount) || 0, 0)
+            this.lastUnreadCount = unreadCount
+            this.lastUnreadAt = !!roomInfo.at
+            this.lastUnreadAtMessageId = roomInfo.atMessageId || null
+            this.unreadDividerCount = unreadCount
+            this.resolveUnreadDividerTarget()
             this.room = {
                 ...roomInfo,
                 users: roomInfo.users || [],
@@ -251,9 +305,6 @@ export default {
 
         // 标记数据准备好了
         this.ready = true
-
-        // 先设置 IPC 监听器，确保能接收到 gotoMessage 事件
-        this.setupIpcListeners()
 
         console.log('ChatWindowView created, pendingGotoMessageId:', this.pendingGotoMessageId)
 
@@ -269,101 +320,251 @@ export default {
             await this.fetchMessage(true)
         }
 
+        // 定位事件可能在初始消息请求期间到达；请求完成后立即补做一次。
+        if (this.pendingGotoMessageId) {
+            const messageId = this.pendingGotoMessageId
+            this.pendingGotoMessageId = null
+            await this.gotoMessage(messageId)
+        }
+
         // 清除未读
         ipc.clearChatWindowUnread(this.roomId)
     },
     beforeDestroy() {
-        // 移除 IPC 监听器
-        ipcRenderer.removeAllListeners('addMessage')
-        ipcRenderer.removeAllListeners('deleteMessage')
-        ipcRenderer.removeAllListeners('hideMessage')
-        ipcRenderer.removeAllListeners('revealMessage')
-        ipcRenderer.removeAllListeners('renewMessage')
-        ipcRenderer.removeAllListeners('setShutUp')
-        ipcRenderer.removeAllListeners('clearUnread')
-        ipcRenderer.removeAllListeners('gotoMessage')
-        ipcRenderer.removeAllListeners('sendDice')
-        ipcRenderer.removeAllListeners('sendRps')
-        ipcRenderer.removeAllListeners('closePanel')
-        ipcRenderer.removeAllListeners('dbUpgradeProgress')
+        this.lifecycleScope?.dispose()
     },
     methods: {
+        async resolveUnreadDividerTarget(unreadCount = this.unreadDividerCount) {
+            unreadCount = Math.max(Number(unreadCount) || 0, 0)
+            if (unreadCount <= 0) return null
+
+            const roomId = this.roomId
+            try {
+                const targetMessageId = await ipc.resolveUnreadTargetMessageId(roomId, unreadCount)
+                if (roomId !== this.roomId || targetMessageId === null || targetMessageId === undefined) return null
+
+                this.unreadDividerTargetId = messageIdKey(targetMessageId)
+                return this.unreadDividerTargetId
+            } catch (error) {
+                console.error('Failed to resolve unread divider target:', error)
+                return null
+            }
+        },
+        clearLastUnreadCount() {
+            this.lastUnreadCount = 0
+        },
+        async clearLastUnreadAt() {
+            const atMessageId = this.lastUnreadAtMessageId
+            this.lastUnreadAt = false
+            this.lastUnreadAtMessageId = null
+            if (!atMessageId) {
+                this.$message.error('找不到未读的 @ 消息')
+                return
+            }
+            await this.$nextTick()
+            if (this.$refs.room?.scrollToMessage(atMessageId, false, true)) return
+            await this.locateMessage(atMessageId)
+        },
+        async locateUnreadMessage(unreadCount, notFoundMessage = '找不到未读消息') {
+            const count = Math.max(Number(unreadCount) || 0, 0)
+            if (!count) return
+            const generation = ++this.messageLoadGeneration
+
+            if (this.unreadDividerTargetId !== null) {
+                await this.gotoMessage(this.unreadDividerTargetId)
+                return
+            }
+
+            if (count <= NEARBY_MESSAGE_LOAD_LIMIT && !this.isInMiddle) {
+                const currentMessages = this.messages.filter((message) => !message.system)
+                const fetchNumber = Math.max(count - currentMessages.length, 0)
+                if (fetchNumber) await this.fetchMessage(false, fetchNumber)
+                if (generation !== this.messageLoadGeneration) return
+
+                const nonSystemMessages = this.messages.filter((message) => !message.system)
+                const target = nonSystemMessages[nonSystemMessages.length - count]
+                if (target) this.unreadDividerTargetId = messageIdKey(target._id)
+                await this.$nextTick()
+                if (target && this.$refs.room?.scrollToMessage(target._id, false, true)) return
+                this.$message.error(notFoundMessage)
+                return
+            }
+
+            this.loading = true
+            try {
+                const targetMessageId = await this.resolveUnreadDividerTarget(count)
+                if (generation !== this.messageLoadGeneration) return
+                if (!targetMessageId) {
+                    this.$message.error(notFoundMessage)
+                    return
+                }
+                await this.gotoMessage(targetMessageId)
+            } finally {
+                if (generation === this.messageLoadGeneration) this.loading = false
+            }
+        },
+        getMessageIndex(messageId) {
+            const key = messageIdKey(messageId)
+            return this.messages.findIndex((message) => messageIdKey(message._id) === key)
+        },
+        setMessageList(messages) {
+            const normalized = normalizeMessageList(messages || [])
+            for (const message of normalized) message.__v_skip = true
+            this.messages = normalized
+        },
+        mergeMessages(messages) {
+            if (!messages.length) return
+            const newMessages = normalizeMessageList(messages).filter(
+                (message) => this.getMessageIndex(message._id) === -1,
+            )
+            if (!newMessages.length) return
+            const lastMessage = this.messages[this.messages.length - 1]
+            if (!lastMessage || compareMessageOrder(lastMessage, newMessages[0]) <= 0) {
+                for (const message of newMessages) message.__v_skip = true
+                this.messages = [...this.messages, ...newMessages]
+                return
+            }
+            this.setMessageList(mergeMessageLists(this.messages, messages))
+        },
+        clearDeferredIncomingMessages() {
+            this.deferredIncomingMessages = []
+            this.deferredIncomingIds.clear()
+        },
+        deferIncomingMessage(message) {
+            const key = messageIdKey(message._id)
+            if (this.getMessageIndex(message._id) !== -1 || this.deferredIncomingIds.has(key)) return
+            message.__v_skip = true
+            this.deferredIncomingMessages.push(message)
+            this.deferredIncomingIds.add(key)
+        },
+        consumeDeferredIncomingMessages(messages) {
+            if (!this.deferredIncomingMessages.length || !messages.length) return
+            const consumedIds = new Set(messages.map((message) => messageIdKey(message._id)))
+            this.deferredIncomingMessages = this.deferredIncomingMessages.filter(
+                (message) => !consumedIds.has(messageIdKey(message._id)),
+            )
+            for (const id of consumedIds) this.deferredIncomingIds.delete(id)
+        },
+        flushDeferredIncomingMessages() {
+            if (!this.deferredIncomingMessages.length) return
+            const messages = this.deferredIncomingMessages
+            this.clearDeferredIncomingMessages()
+            this.mergeMessages(messages)
+        },
+        updateDeferredIncomingMessage(messageId, update) {
+            const key = messageIdKey(messageId)
+            const index = this.deferredIncomingMessages.findIndex((message) => messageIdKey(message._id) === key)
+            if (index !== -1) {
+                this.$set(this.deferredIncomingMessages, index, update(this.deferredIncomingMessages[index]))
+            }
+        },
         setupIpcListeners() {
             // 阻止默认拖拽行为以支持文件拖入
-            document.addEventListener('dragover', (event) => {
+            this.lifecycleScope.onEvent(document, 'dragover', (event) => {
                 event.preventDefault()
                 event.stopPropagation()
             })
 
-            ipcRenderer.on('dbUpgradeProgress', (_, progress) => {
+            this.lifecycleScope.onIpc('dbUpgradeProgress', (_, progress) => {
                 this.dbUpgrade = progress
             })
 
             // 接收新消息
-            ipcRenderer.on('addMessage', (_, { roomId, message }) => {
+            this.lifecycleScope.onIpc('addMessage', (_, { roomId, message }) => {
                 if (roomId === this.roomId) {
-                    const index = this.messages.findIndex((e) => e._id === message._id)
+                    const index = this.getMessageIndex(message._id)
                     if (index !== -1) {
-                        console.warning(`[WARN] Duplicated message ID ${message._id}`, message, this.messages[index])
+                        console.warn(`[WARN] Duplicated message ID ${message._id}`, message, this.messages[index])
                         return
                     }
-                    this.messages = [...this.messages, message]
+                    if (this.deferredIncomingIds.has(messageIdKey(message._id))) return
+                    if (this.isInMiddle) this.deferIncomingMessage(message)
+                    else this.mergeMessages([message])
+                    if (this.unreadDividerCount > 0 && !message.system) this.unreadDividerCount++
+                    if (this.lastUnreadCount >= 10 && !message.system) this.lastUnreadCount++
+                    if (message.at && message.senderId != this.account) {
+                        this.lastUnreadAt = true
+                        this.lastUnreadAtMessageId = String(message._id)
+                    }
                 }
             })
 
             // 删除消息
-            ipcRenderer.on('deleteMessage', (_, messageId) => {
-                const index = this.messages.findIndex((e) => e._id === messageId)
+            this.lifecycleScope.onIpc('deleteMessage', (_, messageId) => {
+                const index = this.getMessageIndex(messageId)
                 if (index !== -1) {
-                    this.messages[index].deleted = Date.now()
-                    this.messages[index].reveal = false
-                    this.messages = [...this.messages]
-                }
+                    this.$set(this.messages, index, {
+                        ...this.messages[index],
+                        deleted: Date.now(),
+                        reveal: false,
+                    })
+                } else
+                    this.updateDeferredIncomingMessage(messageId, (message) => ({
+                        ...message,
+                        deleted: Date.now(),
+                        reveal: false,
+                    }))
             })
 
             // 隐藏消息
-            ipcRenderer.on('hideMessage', (_, messageId) => {
-                const index = this.messages.findIndex((e) => e._id === messageId)
+            this.lifecycleScope.onIpc('hideMessage', (_, messageId) => {
+                const index = this.getMessageIndex(messageId)
                 if (index !== -1) {
-                    this.messages[index].hide = true
-                    this.messages[index].reveal = false
-                    this.messages = [...this.messages]
-                }
+                    this.$set(this.messages, index, {
+                        ...this.messages[index],
+                        hide: true,
+                        reveal: false,
+                    })
+                } else
+                    this.updateDeferredIncomingMessage(messageId, (message) => ({
+                        ...message,
+                        hide: true,
+                        reveal: false,
+                    }))
             })
 
             // 显示消息
-            ipcRenderer.on('revealMessage', (_, messageId) => {
-                const index = this.messages.findIndex((e) => e._id === messageId)
+            this.lifecycleScope.onIpc('revealMessage', (_, messageId) => {
+                const index = this.getMessageIndex(messageId)
                 if (index !== -1) {
-                    this.messages[index].hide = false
-                    this.messages[index].reveal = true
-                    this.messages = [...this.messages]
-                }
+                    this.$set(this.messages, index, {
+                        ...this.messages[index],
+                        hide: false,
+                        reveal: true,
+                    })
+                } else
+                    this.updateDeferredIncomingMessage(messageId, (message) => ({
+                        ...message,
+                        hide: false,
+                        reveal: true,
+                    }))
             })
 
             // 更新消息
-            ipcRenderer.on('renewMessage', (_, { roomId, messageId, message }) => {
+            this.lifecycleScope.onIpc('renewMessage', (_, { roomId, messageId, message }) => {
                 if (roomId === this.roomId) {
-                    const index = this.messages.findIndex((e) => e._id === messageId)
+                    const index = this.getMessageIndex(messageId)
                     if (index !== -1) {
-                        this.messages[index] = { ...this.messages[index], ...message }
-                        this.messages = [...this.messages]
+                        this.$set(this.messages, index, { ...this.messages[index], ...message })
+                    } else if (message) {
+                        this.updateDeferredIncomingMessage(messageId, (current) => ({ ...current, ...message }))
                     }
                 }
             })
 
             // 禁言状态
-            ipcRenderer.on('setShutUp', (_, isShutUp) => {
+            this.lifecycleScope.onIpc('setShutUp', (_, isShutUp) => {
                 this.isShutUp = isShutUp
             })
 
             // 窗口聚焦时清除未读
-            ipcRenderer.on('clearUnread', () => {
-                ipc.clearChatWindowUnread(this.roomId)
+            this.lifecycleScope.onIpc('clearUnread', () => {
+                // 初始化期间先保留 roomInfo 中的未读/@快照，created 结束时再统一清除。
+                if (this.ready) ipc.clearChatWindowUnread(this.roomId)
             })
 
             // 定位到指定消息
-            ipcRenderer.on('gotoMessage', async (_, messageId) => {
+            this.lifecycleScope.onIpc('gotoMessage', async (_, messageId) => {
                 console.log('gotoMessage event received:', messageId, 'ready:', this.ready, 'loading:', this.loading)
                 // 如果消息还没加载完，保存待定位的 ID
                 if (!this.ready || this.loading) {
@@ -376,45 +577,63 @@ export default {
             })
 
             // 发送骰子（菜单操作）
-            ipcRenderer.on('sendDice', (_) => {
+            this.lifecycleScope.onIpc('sendDice', (_) => {
                 this.sendDice(0)
             })
 
             // 发送猜拳（菜单操作）
-            ipcRenderer.on('sendRps', (_) => {
+            this.lifecycleScope.onIpc('sendRps', (_) => {
                 this.sendRps(0)
             })
 
             // 关闭表情面板
-            ipcRenderer.on('closePanel', () => {
+            this.lifecycleScope.onIpc('closePanel', () => {
                 this.panel = ''
             })
         },
 
         async fetchMessage(reset, number) {
+            let generation = this.messageLoadGeneration
             if (reset) {
-                this.messages = []
+                generation = ++this.messageLoadGeneration
+                this.loading = false
+                this.clearDeferredIncomingMessages()
+                this.isInMiddle = false
+                this.setMessageList([])
                 this.messagesLoaded = false
             }
+            let cursor = !reset && this.messages.length ? getMessageCursor(this.messages[0]) : null
+            const messagePages = []
+            let lastPage = []
+            let nonSystemMessageCount = 0
             this.loading = true
             try {
-                const offset = reset ? 0 : this.messages.length
-                const msgs = await ipc.fetchMessage(this.roomId, offset)
-                if (reset) {
-                    this.messages = msgs || []
-                } else {
-                    this.messages = [...(msgs || []), ...this.messages]
-                }
-                this.messagesLoaded = true
+                do {
+                    const page = await ipc.fetchMessage(this.roomId, cursor ? { before: cursor } : {})
+                    lastPage = page || []
+                    if (lastPage.length) cursor = getMessageCursor(lastPage[0])
+                    messagePages.unshift(lastPage)
+                    nonSystemMessageCount += lastPage.filter((message) => !message.system).length
+                    if (!number || nonSystemMessageCount >= number || !lastPage.length) break
+                    if (generation !== this.messageLoadGeneration) return
+                } while (true)
+                if (generation !== this.messageLoadGeneration) return
+
+                const messages = messagePages.flat()
+                if (reset) this.setMessageList(messages)
+                else this.mergeMessages(messages)
+                this.messagesLoaded = !lastPage.length || lastPage.length < 20
             } catch (e) {
                 console.error('Failed to fetch messages:', e)
             } finally {
-                this.loading = false
+                if (generation === this.messageLoadGeneration) this.loading = false
             }
         },
 
         async sendMessage(data) {
             let { content, files, replyMessage, media: extraMedia, sticker, messageType, resend } = data
+
+            if (this.isInMiddle) await this.returnToLatest()
 
             const hasImages = (files || []).some((file) => file.type.includes('image'))
             const compressImages = hasImages ? (await ipc.getSettings()).compressImages : false
@@ -554,73 +773,130 @@ export default {
             return name.replace(/\[.*?\]/g, '').trim() || name
         },
 
+        async locateMessage(messageId) {
+            const roomId = this.roomId
+            const generation = ++this.messageLoadGeneration
+            this.loading = true
+            try {
+                await this.fetchMessage(false, NEARBY_MESSAGE_LOAD_LIMIT)
+                if (generation !== this.messageLoadGeneration || roomId !== this.roomId) return
+                await this.$nextTick()
+                if (this.$refs.room?.scrollToMessage(messageId, false, true)) return
+            } finally {
+                if (generation === this.messageLoadGeneration) this.loading = false
+            }
+
+            if (generation === this.messageLoadGeneration && roomId === this.roomId) {
+                await this.gotoMessage(messageId)
+            }
+        },
+
         async gotoMessage(messageId) {
             // 先尝试在当前消息列表中查找
-            const existingIndex = this.messages.findIndex((m) => m._id === messageId)
+            const existingIndex = this.getMessageIndex(messageId)
             if (existingIndex !== -1) {
                 // 消息已存在，直接滚动并高亮
                 this.$nextTick(() => {
                     if (this.$refs.room) {
-                        this.$refs.room.scrollToMessage(messageId)
+                        this.$refs.room.scrollToMessage(messageId, false, true)
                     }
                 })
                 return
             }
 
             // 消息不在当前列表中，需要加载指定消息前后的消息
+            const generation = ++this.messageLoadGeneration
+            const previousMiddleState = this.isInMiddle
+            this.isInMiddle = true
             this.loading = true
             try {
                 const msgs = await ipc.fetchMessagesAround(this.roomId, messageId, 20, 20)
+                if (generation !== this.messageLoadGeneration) return
                 if (msgs && msgs.length > 0) {
-                    this.messages = msgs
-                    this.messagesLoaded = false // 允许继续向上加载
-                    this.isInMiddle = true // 标记从中间加载
+                    this.setMessageList(msgs)
+                    this.consumeDeferredIncomingMessages(msgs)
+                    const targetIndex = this.getMessageIndex(messageId)
+                    if (targetIndex === -1) {
+                        this.$message.error('找不到该消息')
+                        this.isInMiddle = previousMiddleState
+                        if (!this.isInMiddle) this.flushDeferredIncomingMessages()
+                        return
+                    }
+                    this.messagesLoaded = targetIndex < 20
+                    // Keep the window detached from the live tail until an explicit
+                    // after-cursor request proves that no gap remains.
+                    this.isInMiddle = true
                     this.targetMessageId = messageId
                     this.$nextTick(() => {
                         if (this.$refs.room) {
-                            this.$refs.room.scrollToMessage(messageId)
+                            this.$refs.room.scrollToMessage(messageId, false, true)
                         }
                     })
                 } else {
                     this.$message.error('找不到该消息')
+                    this.isInMiddle = previousMiddleState
+                    if (!this.isInMiddle) this.flushDeferredIncomingMessages()
                 }
             } catch (e) {
                 console.error('Failed to goto message:', e)
                 this.$message.error('定位消息失败')
+                if (generation === this.messageLoadGeneration) {
+                    this.isInMiddle = previousMiddleState
+                    if (!this.isInMiddle) this.flushDeferredIncomingMessages()
+                }
             } finally {
-                this.loading = false
+                if (generation === this.messageLoadGeneration) this.loading = false
             }
         },
 
         async fetchMessageAfter() {
-            console.log('fetchMessageAfter called, isInMiddle:', this.isInMiddle, 'loading:', this.loading)
             if (!this.isInMiddle || this.loading) return
             const lastMessage = this.messages[this.messages.length - 1]
             if (!lastMessage) return
 
+            const generation = this.messageLoadGeneration
             this.loading = true
             try {
-                // 使用 fetchMessagesAround，before=0 表示只获取之后的消息
-                console.log('Fetching messages after:', lastMessage._id)
-                const msgs = await ipc.fetchMessagesAround(this.roomId, lastMessage._id, 0, 20)
-                console.log('Got messages:', msgs?.length)
-                if (msgs && msgs.length > 1) {
-                    // 去掉第一条（就是 lastMessage 本身）
-                    const newMsgs = msgs.slice(1)
-                    if (newMsgs.length > 0) {
-                        this.messages = [...this.messages, ...newMsgs]
-                    } else {
-                        // 没有更多新消息了，退出中间模式
-                        this.isInMiddle = false
-                    }
-                } else {
-                    // 没有更多新消息了，退出中间模式
+                const msgs = await ipc.fetchMessage(this.roomId, { after: getMessageCursor(lastMessage) })
+                if (generation !== this.messageLoadGeneration) return
+                if (msgs?.length) {
+                    this.consumeDeferredIncomingMessages(msgs)
+                    this.mergeMessages(msgs)
+                }
+                if (!msgs || msgs.length < 20) {
+                    this.flushDeferredIncomingMessages()
+                    // Let Room process the tail append while canLoadAfter is still true.
+                    // Otherwise its generic messages watcher mistakes this final page for
+                    // a normal live-message update and scrolls the whole window to bottom.
+                    await this.$nextTick()
+                    if (generation !== this.messageLoadGeneration) return
                     this.isInMiddle = false
                 }
             } catch (e) {
                 console.error('Failed to fetch messages after:', e)
             } finally {
-                this.loading = false
+                if (generation === this.messageLoadGeneration) this.loading = false
+            }
+        },
+        async returnToLatest() {
+            const generation = ++this.messageLoadGeneration
+            this.loading = true
+            try {
+                const messages = (await ipc.fetchMessage(this.roomId, {})) || []
+                if (generation !== this.messageLoadGeneration) return false
+
+                this.setMessageList(messages)
+                this.isInMiddle = false
+                this.messagesLoaded = messages.length < 20
+                this.flushDeferredIncomingMessages()
+                this.$nextTick(() => this.$refs.room?.queueScrollToBottom(true))
+                return true
+            } catch (error) {
+                console.error('Failed to return to latest messages:', error)
+                this.$message.error('返回最新消息失败')
+                return false
+            } finally {
+                if (generation === this.messageLoadGeneration) this.loading = false
             }
         },
 
@@ -637,13 +913,15 @@ export default {
                 if (next > max) next = max
                 this.stickerPanelHeight = next
             }
+            let removeMoveListener
+            let removeUpListener
             const onUp = () => {
-                window.removeEventListener('mousemove', onMove)
-                window.removeEventListener('mouseup', onUp)
+                removeMoveListener()
+                removeUpListener()
                 ipc.setStickerPanelHeight(this.stickerPanelHeight)
             }
-            window.addEventListener('mousemove', onMove)
-            window.addEventListener('mouseup', onUp)
+            removeMoveListener = this.lifecycleScope.onEvent(window, 'mousemove', onMove)
+            removeUpListener = this.lifecycleScope.onEvent(window, 'mouseup', onUp)
         },
     },
 }
@@ -653,12 +931,14 @@ export default {
 .chat-window-root {
     height: 100vh;
     width: 100%;
+    overflow: hidden;
 }
 
 .chat-window-body {
     display: flex;
     height: 100vh;
     width: 100%;
+    overflow: hidden;
 }
 
 .chat-window-body-bottom {

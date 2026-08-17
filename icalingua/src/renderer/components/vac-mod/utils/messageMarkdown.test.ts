@@ -33,6 +33,81 @@ test('parses QQ inline commands and their reply flag', () => {
     assert.equal(parseMessageMarkdownInlineCommand('https://example.com/inlinecmd?command=%2Ftest'), null)
 })
 
+test('renders QQ TeX colors and bold text in display, inline, and quoted Markdown', () => {
+    const source = `[](%7B%22version%22%3A2%7D)
+$$\\colorbox{#E8F5E9}{\\textcolor{#2E7D32}{\\textbf{ 🎣 已收竿 }}}$$
+抛竿14次 | $\\textcolor{#2E7D32}{\\textbf{✅钓获14条}}$ | 💨逃脱0条 | 💥断线0条
+灵力:0/999
+状态:$$\\colorbox{#F5F5F5}{\\textcolor{#424242}{\\textbf{⏸ 空闲}}}$$
+
+**📋 钓获清单（已结算入包）**
+> 🐟 $\\textcolor{#6A1B9A}{\\textbf{紫烟鳅}}$ ×3 最大 3.400万亿吨`
+    const html = renderMessageMarkdown(source)
+
+    assert.match(html, /<div class="vac-markdown-math vac-markdown-math-display">/)
+    assert.match(html, /class="katex-display"/)
+    assert.match(html, /background-color:#E8F5E9/)
+    assert.match(html, /color:#2E7D32/)
+    assert.match(html, /background-color:#F5F5F5/)
+    assert.match(html, /color:#6A1B9A/)
+    assert.match(html, /<blockquote><p>🐟 <span class="vac-markdown-math">/)
+    assert.doesNotMatch(html, /katex-error/)
+    assert.doesNotMatch(html, /version|%7B/)
+})
+
+test('keeps unmatched double-dollar delimiters intact instead of splitting them', () => {
+    const html = renderMessageMarkdown('状态:$$未完成')
+
+    assert.match(html, /状态:\$\$未完成/)
+    assert.doesNotMatch(html, /vac-markdown-math/)
+})
+
+test('does not put unsafe TeX colors into inline styles', () => {
+    const html = renderMessageMarkdown('$\\textcolor{javascript:alert(1)}{安全文本}$')
+
+    assert.match(html, /安全文本/)
+    assert.doesNotMatch(html, /javascript/i)
+    assert.doesNotMatch(html, /katex-error/)
+})
+
+test('renders grouped and declaration-style LaTeX tiny text', () => {
+    const html = renderMessageMarkdown('$\\tiny{小字}$ / $\\tiny 后续小字$')
+
+    assert.match(html, /class="[^\"]*katex-sizing[^\"]*size1[^\"]*"/)
+    assert.match(html, /小字/)
+    assert.match(html, /后续小字/)
+    assert.doesNotMatch(html, /katex-error/)
+})
+
+test('renders common LaTeX formulas, delimiters, operators, and aligned matrices', () => {
+    const html = renderMessageMarkdown(
+        [
+            '行内 $\\frac{-b \\pm \\sqrt{b^2-4ac}}{2a}$ 与 \\(\\alpha_1^2 + \\beta^2\\)',
+            '\\[',
+            '\\begin{aligned}',
+            'S_n &= \\sum_{i=1}^{n} i = \\frac{n(n+1)}{2} \\\\',
+            'I &= \\int_0^1 x^2 \\, dx',
+            '\\end{aligned}',
+            '\\]',
+        ].join('\n'),
+    )
+
+    assert.match(html, /class="mfrac"/)
+    assert.match(html, /class="[^"]*sqrt[^"]*"/)
+    assert.match(html, /class="msupsub"/)
+    assert.match(html, /class="[^"]*op-symbol large-op[^"]*"/)
+    assert.match(html, /class="mtable"/)
+    assert.match(html, /class="katex-display"/)
+    assert.doesNotMatch(html, /katex-error/)
+})
+
+test('keeps untrusted LaTeX links disabled', () => {
+    const html = renderMessageMarkdown('$\\href{javascript:alert(1)}{危险链接}$')
+
+    assert.doesNotMatch(html, /<a\s/i)
+    assert.doesNotMatch(html, /href="javascript:/i)
+})
+
 test('renders every formatting type supported by QQ Markdown', () => {
     const html = renderMessageMarkdown(`# 一级标题
 ## 二级标题

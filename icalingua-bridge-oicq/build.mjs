@@ -5,11 +5,14 @@ const pkg = JSON.parse(readFileSync('./package.json', 'utf-8'))
 const external = Object.keys(pkg.dependencies || {}).filter((dep) => !dep.startsWith('@saltify/'))
 
 await build({
-    entryPoints: ['index.ts'],
+    entryPoints: {
+        index: 'index.ts',
+        dbWorker: '../packages/storageProviders/DBWorkerEntry.ts',
+    },
     bundle: true,
     platform: 'node',
     target: 'node20',
-    outfile: 'build/index.js',
+    outdir: 'build',
     external,
     sourcemap: true,
 })

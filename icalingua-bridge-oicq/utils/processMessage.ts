@@ -1,7 +1,6 @@
 import BilibiliMiniApp from '@icalingua/types/BilibiliMiniApp'
 import Message from '@icalingua/types/Message'
 import StructMessageCard from '@icalingua/types/StructMessageCard'
-import { base64decode } from 'nodejs-base64'
 import { AtElem, FileElem, FriendInfo, GroupMessageEventData, MemberBaseInfo } from 'oicq-icalingua-plus-plus'
 import path from 'path'
 import type oicqAdapter from '../adapters/oicqAdapter'
@@ -24,6 +23,15 @@ type SilkDecodeCompleter = {
     renewMessage: (roomId: number, messageId: string, message: Partial<Message>) => void
     getMessage?: (roomId: number, messageId: string) => Promise<Message | null>
 }
+
+const base64decode = (str: string): string => {
+    if (typeof str !== 'string') {
+        throw new Error('Input value must be a string.')
+    }
+    return Buffer.from(str, 'base64').toString('utf8')
+}
+
+const getErrorMessage = (error: unknown) => (error instanceof Error ? error.message : String(error))
 
 let silkDecodeCompleter: SilkDecodeCompleter | null = null
 
@@ -75,7 +83,7 @@ const scheduleAsyncSilkDecode = (roomId: number, message: Message, url: string, 
                 message.content = clearDecodingPlaceholderContent(message.content)
             } catch (e) {
                 console.error(e)
-                message.content = '[语音转换失败]' + (e as Error).message + '\n' + url
+                message.content = '[语音转换失败]' + getErrorMessage(e) + '\n' + url
             }
             return
         }
@@ -111,7 +119,7 @@ const scheduleAsyncSilkDecode = (roomId: number, message: Message, url: string, 
             })
         } catch (e) {
             console.error(e)
-            message.content = '[语音转换失败]' + (e as Error).message + '\n' + url
+            message.content = '[语音转换失败]' + getErrorMessage(e) + '\n' + url
             try {
                 await completer.replaceMessage(roomId, messageId, message)
                 completer.renewMessage(roomId, String(messageId), {
@@ -333,11 +341,11 @@ const createProcessMessage = (adapter: typeof oicqAdapter) => {
                         }
                         let user_id: number, time: number
                         const parsed = Buffer.from(m.data.id, 'base64')
-                        if (m.data.id.length > 24) {
+                        if (parsed.length === 21) {
                             // Group
                             user_id = parsed.readUInt32BE(4)
                             time = parsed.readUInt32BE(16)
-                        } else if (m.data.id.length > 20) {
+                        } else if (parsed.length === 17) {
                             // C2C
                             user_id = parsed.readUInt32BE(0)
                             time = parsed.readUInt32BE(12)
@@ -638,7 +646,7 @@ const createProcessMessage = (adapter: typeof oicqAdapter) => {
                                 message.files.push(message.file)
                             } catch (e) {
                                 console.error(e)
-                                message.content = '[语音转换失败]' + (e as Error).message + '\n' + recordUrl
+                                message.content = '[语音转换失败]' + getErrorMessage(e) + '\n' + recordUrl
                             }
                         }
                         break

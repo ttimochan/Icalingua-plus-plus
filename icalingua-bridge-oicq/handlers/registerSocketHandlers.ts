@@ -1,4 +1,5 @@
 import Message from '@icalingua/types/Message'
+import MessagePageOptions from '@icalingua/types/MessagePage'
 import { Server, Socket } from 'socket.io'
 import type oicqAdapter from '../adapters/oicqAdapter'
 import gfsTokenManager from '../utils/gfsTokenManager'
@@ -24,8 +25,8 @@ export default (io: Server, socket: Socket, adapter: typeof oicqAdapter) => {
     socket.on('fetch7DaysHistory', adapter.fetch7DaysHistory)
     socket.on(
         'fetchMessages',
-        (roomId: number, offset: number, resolve: (value: Message[] | PromiseLike<Message[]>) => void) =>
-            adapter.fetchMessages(roomId, offset, socket, resolve),
+        (roomId: number, options: MessagePageOptions, resolve: (value: Message[] | PromiseLike<Message[]>) => void) =>
+            adapter.fetchMessages(roomId, options || {}, socket, resolve),
     )
     socket.on(
         'fetchImageMessages',
@@ -47,6 +48,14 @@ export default (io: Server, socket: Socket, adapter: typeof oicqAdapter) => {
         ) => adapter.fetchMessagesAround(roomId, messageId, before, after, socket, resolve),
     )
     socket.on(
+        'resolveUnreadTargetMessageId',
+        (roomId: number, unreadCount: number, resolve: (messageId: string | null) => void) =>
+            adapter.resolveUnreadTargetMessageId(roomId, unreadCount, resolve),
+    )
+    socket.on('markMessageUnread', (roomId: number, messageId: string, resolve: (unreadCount: number) => void) =>
+        adapter.markMessageUnread(roomId, messageId, resolve),
+    )
+    socket.on(
         'fetchMessagesBySender',
         (
             roomId: number,
@@ -61,8 +70,22 @@ export default (io: Server, socket: Socket, adapter: typeof oicqAdapter) => {
             roomId: number,
             keyword: string,
             offset: number,
+            senderId: number | undefined,
+            startTime: number | undefined,
+            endTime: number | undefined,
             resolve: (value: Message[] | PromiseLike<Message[]>) => void,
-        ) => adapter.searchMessages(roomId, keyword, offset, socket, resolve),
+        ) => {
+            adapter.searchMessages(
+                roomId,
+                keyword,
+                offset,
+                senderId ?? undefined,
+                startTime ?? undefined,
+                endTime ?? undefined,
+                socket,
+                resolve,
+            )
+        },
     )
     socket.on('getFirstUnreadRoom', adapter.getFirstUnreadRoom)
     socket.on('getForwardMsg', adapter.getForwardMsg)

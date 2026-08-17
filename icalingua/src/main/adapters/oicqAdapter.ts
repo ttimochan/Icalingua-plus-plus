@@ -6,6 +6,7 @@ import BilibiliMiniApp from '@icalingua/types/BilibiliMiniApp'
 import IgnoreChatInfo from '@icalingua/types/IgnoreChatInfo'
 import LoginForm from '@icalingua/types/LoginForm'
 import Message from '@icalingua/types/Message'
+import MessagePageOptions from '@icalingua/types/MessagePage'
 import RoamingStamp from '@icalingua/types/RoamingStamp'
 import Room from '@icalingua/types/Room'
 import SearchableFriend from '@icalingua/types/SearchableFriend'
@@ -17,7 +18,6 @@ import { app, dialog, Notification as ElectronNotification } from 'electron'
 import { Notification } from 'freedesktop-notifications'
 import fs from 'fs'
 import crypto from 'crypto'
-import { base64decode } from 'nodejs-base64'
 import {
     Client,
     createClient,
@@ -213,7 +213,10 @@ const eventHandlers = {
         }
 
         const at = message.at
-        if (at) room.at = at
+        if (at) {
+            room.at = at
+            room.atMessageId = String(message._id)
+        }
 
         if (!room.priority) {
             room.priority = groupId ? 2 : 4
@@ -344,6 +347,7 @@ const eventHandlers = {
             room.unreadCount = 0
             room.at = false
         } else room.unreadCount++
+        if (!room.at) room.atMessageId = null
         // 加上同一秒收到消息的id，防止消息乱序
         room.utime = data.time * 1000 + lastReceivedMessageInfo.id
         room.lastMessage = lastMessage
@@ -1993,8 +1997,9 @@ const adapter: OicqAdapter = {
         }
         return groupsAll
     },
-    async fetchMessages(roomId: number, offset: number) {
-        if (!offset) {
+    async fetchMessages(roomId: number, options: MessagePageOptions) {
+        const initialPage = !options?.before && !options?.after
+        if (initialPage) {
             adapter.clearRoomUnread(roomId).then(updateTrayIcon)
             if (roomId < 0) {
                 const gid = -roomId
@@ -2009,13 +2014,14 @@ const adapter: OicqAdapter = {
                 ui.setShutUp(false)
             }
         }
-        currentLoadedMessagesCount = offset + 20
-        const messages = (await storage.fetchMessages(roomId, offset, 20)) || []
+        const messages = (await storage.fetchMessages(roomId, options || {}, 20)) || []
+        if (initialPage) currentLoadedMessagesCount = messages.length
+        else if (options?.before) currentLoadedMessagesCount += messages.length
         // 替换消息中的 rkey
         for (const message of messages) {
             await processMessageRkey(message)
         }
-        if (messages.length && !offset && typeof messages[messages.length - 1]._id === 'string')
+        if (messages.length && initialPage && typeof messages[messages.length - 1]._id === 'string')
             adapter.reportRead(<string>messages[messages.length - 1]._id)
         return messages
     },
@@ -2035,6 +2041,9 @@ const adapter: OicqAdapter = {
         }
         return messages
     },
+    resolveUnreadTargetMessageId(roomId: number, unreadCount: number) {
+        return storage.resolveUnreadTargetMessageId(roomId, unreadCount)
+    },
     async fetchMessagesBySender(roomId: number, senderId: number, offset: number) {
         const messages = (await storage.fetchMessagesBySender(roomId, String(senderId), offset, 20)) || []
         // 替换消息中的 rkey
@@ -2043,8 +2052,24 @@ const adapter: OicqAdapter = {
         }
         return messages
     },
-    async searchMessages(roomId: number, keyword: string, offset: number) {
-        const messages = (await storage.searchMessages(roomId, keyword, offset, 20)) || []
+    async searchMessages(
+        roomId: number,
+        keyword: string,
+        offset: number,
+        senderId?: number,
+        startTime?: number,
+        endTime?: number,
+    ) {
+        const messages =
+            (await storage.searchMessages(
+                roomId,
+                keyword,
+                offset,
+                20,
+                senderId === undefined ? undefined : String(senderId),
+                startTime,
+                endTime,
+            )) || []
         // 替换消息中的 rkey
         for (const message of messages) {
             await processMessageRkey(message)
@@ -2172,7 +2197,7 @@ const adapter: OicqAdapter = {
     },
     async clearRoomUnread(roomId: number) {
         ui.clearRoomUnread(roomId)
-        await storage.updateRoom(roomId, { unreadCount: 0, at: false })
+        await storage.updateRoom(roomId, { unreadCount: 0, at: false, atMessageId: null })
         await updateTrayIcon()
     },
     async markRoomUnread(roomId: number) {
@@ -2180,8 +2205,21 @@ const adapter: OicqAdapter = {
         if (!room) return
         room.unreadCount = Math.max(room.unreadCount || 0, 1)
         room.at = false
+        room.atMessageId = null
         ui.updateRoom(room)
-        await storage.updateRoom(roomId, { unreadCount: room.unreadCount, at: false })
+        await storage.updateRoom(roomId, { unreadCount: room.unreadCount, at: false, atMessageId: null })
+        await updateTrayIcon()
+    },
+    async markMessageUnread(roomId: number, messageId: string) {
+        const room = await storage.getRoom(roomId)
+        if (!room) return
+        const unreadCount = await storage.countUnreadMessagesFrom(roomId, messageId)
+        if (!unreadCount) return
+        room.unreadCount = unreadCount
+        room.at = false
+        room.atMessageId = null
+        ui.updateRoom(room)
+        await storage.updateRoom(roomId, { unreadCount, at: false, atMessageId: null })
         await updateTrayIcon()
     },
     async setRoomPriority(roomId: number, priority: 1 | 2 | 3 | 4 | 5) {
@@ -2419,7 +2457,7 @@ const adapter: OicqAdapter = {
         await storage.addMessages(roomId, messages)
         let room = await storage.getRoom(roomId)
         if (roomId === ui.getSelectedRoomId())
-            storage.fetchMessages(roomId, 0, currentLoadedMessagesCount + 20).then(ui.setMessages)
+            storage.fetchMessages(roomId, {}, currentLoadedMessagesCount + 20).then(ui.setMessages)
         if (done) {
             ui.messageSuccess(`${room.roomName}(${Math.abs(roomId)}) 已拉取 ${messages.length} 条消息`)
             ui.clearHistoryCount()

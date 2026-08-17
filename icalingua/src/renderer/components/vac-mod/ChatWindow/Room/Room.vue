@@ -35,8 +35,10 @@
             @back-contact="$emit('back-contact')"
             @open-group-member-panel="$emit('open-group-member-panel')"
         >
-            <template v-for="(index, name) in $scopedSlots" v-if="name !== 'messages-top'" #[name]="data">
-                <slot :name="name" v-bind="data" />
+            <template v-for="(index, name) in $scopedSlots" #[name]="data">
+                <template v-if="name !== 'messages-top'">
+                    <slot :name="name" v-bind="data" />
+                </template>
             </template>
         </room-header>
 
@@ -107,31 +109,34 @@
                             <message
                                 :current-user-id="currentUserId"
                                 :message="m"
-                                :index="i + visibleViewport.head"
-                                :messages="messages"
+                                :show-date="
+                                    i + visibleViewport.head > 0 &&
+                                    m.date !== messages[i + visibleViewport.head - 1].date
+                                "
+                                :message-offset="
+                                    i + visibleViewport.head > 0 &&
+                                    m.senderId !== messages[i + visibleViewport.head - 1].senderId
+                                "
                                 :audio-session="getAudioSession(m)"
                                 :edited-message="editedMessage"
-                                :message-actions="messageActions"
                                 :room-users="room.users"
                                 :text-messages="textMessages"
-                                :room-footer-ref="$refs.roomFooter"
-                                :new-messages="newMessages"
-                                :show-reaction-emojis="showReactionEmojis"
-                                :show-new-messages-divider="showNewMessagesDivider"
+                                :show-new-messages-divider="
+                                    (showNewMessagesDivider || unreadDividerTargetId !== null) &&
+                                    unreadDividerMessageId !== null &&
+                                    String(unreadDividerMessageId) === String(m._id)
+                                "
                                 :text-formatting="textFormatting"
-                                :emojis-list="emojisList"
                                 :showForwardPanel="showForwardPanel"
-                                :selectUpdateKey="selectUpdateKey"
-                                :selectedMessage="selectedMessage"
+                                :selected="selectedMessageIds.has(String(m._id))"
                                 :linkify="linkify"
                                 :forward-res-id="forwardResId"
-                                :msgsToForward="msgsToForward"
                                 :usePanguJs="usePanguJsRecv"
                                 @open-file="openFile"
-                                @add-new-message="addNewMessage"
                                 @ctx="msgctx($event, m)"
                                 @avatar-ctx="avatarCtx(m, $event)"
                                 @download-image="$emit('download-image', $event)"
+                                @open-image="openMessageImage"
                                 @poke="$emit('pokegroup', m.senderId)"
                                 @open-forward="$emit('open-forward', $event)"
                                 @start-chat="(e, f) => $emit('start-chat', e, f)"
@@ -146,11 +151,7 @@
                                 :disableQLottie="disableQLottie"
                                 :record-path="recordPath"
                                 :isSteamVrRunning="isSteamVrRunning"
-                            >
-                                <template v-for="(index, name) in $scopedSlots" #[name]="data">
-                                    <slot :name="name" v-bind="data" />
-                                </template>
-                            </message>
+                            />
                         </div>
                     </transition-group>
                     <transition name="vac-fade-message">
@@ -207,13 +208,17 @@
             </transition>
             <transition name="vac-bounce">
                 <div
-                    v-if="scrollIcon || (visibleViewport.tail !== messages.length && messages.length !== 0)"
+                    v-if="
+                        scrollIcon ||
+                        pendingMessagesCount ||
+                        (visibleViewport.tail !== messages.length && messages.length !== 0)
+                    "
                     class="vac-icon-scroll"
                     @click="scrollToBottom"
                 >
                     <transition name="vac-bounce">
-                        <div v-if="scrollMessagesCount" class="vac-badge-counter vac-messages-count">
-                            {{ scrollMessagesCount }}
+                        <div v-if="newMessagesCount" class="vac-badge-counter vac-messages-count">
+                            {{ newMessagesCount }}
                         </div>
                     </transition>
                     <slot name="scroll-icon">
@@ -239,11 +244,12 @@
                 @open-forward="$emit('open-forward', $event)"
             >
                 <template v-for="(index, name) in $scopedSlots" #[name]="data">
-                    <slot :name="name" v-bind="data" />
+                    <template v-if="name !== 'messages-top'">
+                        <slot :name="name" v-bind="data" />
+                    </template>
                 </template>
             </room-message-reply>
             <RoomForwardMessage
-                :messages="messages"
                 :showForwardPanel="showForwardPanel"
                 :msgsToForward="msgsToForward"
                 v-on="$listeners"
@@ -377,6 +383,7 @@
                         ref="quickface"
                         v-show="isQuickFaceOn"
                         v-slot="{ id, name }"
+                        virtual-scroll
                         :list="faceNames"
                         description="face(s)"
                         searchMethod="startsWith"
@@ -394,6 +401,8 @@
                         ref="quickat"
                         v-show="isQuickAtOn && room.roomId < 0"
                         v-slot="{ id, name }"
+                        :count-excluded-ids="[0]"
+                        virtual-scroll
                         :list="
                             groupMembers
                                 ? groupMembers.map(({ card, nickname, user_id }) => [
@@ -404,14 +413,19 @@
                         "
                         description="member(s)"
                         searchMethod="includes"
-                        inputSize="200"
+                        inputSize="280"
                         @cancel="closeQuickAt"
                         @confirm="useQuickAt"
                         @nomatch="nomatchQuickAt"
                     >
-                        <el-avatar size="small" v-if="id !== 0" :src="`https://q1.qlogo.cn/g?b=qq&nk=${id}&s=40`" />
-                        <p style="word-wrap: 'break-word'; margin-right: auto; margin-left: 5px">{{ name }}</p>
-                        <p v-if="id !== 0" style="font-family: 'monospace'">{{ id }}</p>
+                        <el-avatar
+                            v-if="id !== 0"
+                            class="quick-at-avatar"
+                            size="small"
+                            :src="`https://q1.qlogo.cn/g?b=qq&nk=${id}&s=40`"
+                        />
+                        <p class="quick-at-name" :title="name">{{ name }}</p>
+                        <p v-if="id !== 0" class="quick-at-id">{{ id }}</p>
                     </SearchInput>
                 </transition>
 
@@ -550,11 +564,9 @@
 import fs from 'fs'
 import path from 'path'
 import { ipcRenderer, webUtils } from 'electron'
-import _ from 'lodash'
 
 import InfiniteLoading from 'vue-infinite-loading'
 import vClickOutside from 'v-click-outside'
-import emojis from 'vue-emoji-picker/src/emojis'
 
 import Loader from '../../components/Loader'
 import SvgIcon from '../../components/SvgIcon'
@@ -570,10 +582,13 @@ import faceNames from '../../../../../../static/faceNames'
 import getStaticPath from '../../../../../utils/getStaticPath'
 
 import ipc from '../../../../utils/ipc'
+import { compareMessageOrder, messageIdKey } from '../../../../utils/messageOrder'
+import { createRendererLifecycleScope } from '../../../../utils/rendererLifecycleScope'
 import { detectMobile, iOSDevice } from '../../utils/mobileDetection'
 import { isImageFile, isVideoFile, isAudioFile } from '../../utils/mediaFile'
 import { getOrderedMessageParts } from '../../utils/messageMediaOrder'
 import Recorder from '../../utils/recorder'
+import groupMemberCache from '@/utils/groupMemberCache'
 
 const faceDir = path.join(getStaticPath(), 'face')
 const messageDraftStorageKey = 'icalingua:message-draft'
@@ -619,6 +634,8 @@ export default {
         showEmojis: { type: Boolean, required: true },
         showReactionEmojis: { type: Boolean, required: true },
         showNewMessagesDivider: { type: Boolean, required: true },
+        unreadDividerCount: { type: Number, default: 0 },
+        unreadDividerTargetId: { type: [String, Number], default: null },
         showFooter: { type: Boolean, required: true },
         showHeader: { type: Boolean, default: true },
         acceptedFiles: { type: String, required: true },
@@ -637,6 +654,7 @@ export default {
         usePanguJsRecv: { type: Boolean, required: false, default: false },
         isSteamVrRunning: { type: Boolean, required: false, default: false },
         canLoadAfter: { type: Boolean, required: false, default: false },
+        pendingMessagesCount: { type: Number, required: false, default: 0 },
         standalone: { type: Boolean, default: false },
         windowDragEnabled: { type: Boolean, default: false },
     },
@@ -655,13 +673,11 @@ export default {
             emojiOpened: false,
             scrollIcon: false,
             scrollMessagesCount: 0,
-            newMessages: [],
             keepKeyboardOpen: false,
             textareaCursorPosition: null,
             textMessages: require('../../locales').default,
             editAndResend: false,
             msgsToForward: [],
-            selectUpdateKey: 0,
             showForwardPanel: false,
             isQuickFaceOn: false,
             isQuickAtOn: false,
@@ -669,7 +685,6 @@ export default {
             faceDir,
             groupMembers: null,
             useAtKey: false,
-            selectedMessage: '',
             visibleViewport: {
                 head: 0,
                 tail: 0,
@@ -684,9 +699,6 @@ export default {
                 tail: null,
             },
             optimizeMethod: 'infinite-loading',
-            scrollingTolastMessage: 0,
-            scrollingToReplyMessage: null,
-            scrollingToReplyMessageRetryCount: 0,
             hideChatImageByDefault: false,
             hideChatVideoByDefault: false,
             localImageViewerByDefault: false,
@@ -695,10 +707,13 @@ export default {
             mouseSelecting: false,
             mouseSelectArea: null,
             mouseSelectIds: null,
+            mouseSelectFrame: null,
+            mouseSelectBounds: null,
             isMessageEmpty: true,
             membersCount: 0,
-            checkCanScrollTimer: null,
             scrollToBottomTimer: null,
+            scrollToBottomGeneration: 0,
+            textareaResizeScheduled: false,
             pasteIcon: `file://${__static}/Clipboard.svg`,
             audioSessions: {},
             audioPreviewSession: { audio: new Audio() },
@@ -714,12 +729,19 @@ export default {
             audioRecordingStartedAt: 0,
             messageDraftSaveTimer: null,
             pendingMessageDraft: '',
+            messageListSnapshot: {
+                length: Array.isArray(this.messages) ? this.messages.length : 0,
+                firstId: Array.isArray(this.messages) && this.messages.length ? this.messages[0]._id : null,
+                lastId:
+                    Array.isArray(this.messages) && this.messages.length
+                        ? this.messages[this.messages.length - 1]._id
+                        : null,
+            },
         }
     },
     computed: {
-        emojisList() {
-            const emojisTable = Object.keys(emojis).map((key) => emojis[key])
-            return Object.assign({}, ...emojisTable)
+        newMessagesCount() {
+            return Math.max(Number(this.scrollMessagesCount) || 0, Number(this.pendingMessagesCount) || 0)
         },
         room() {
             return this.rooms.find((room) => room.roomId === this.roomId) || {}
@@ -740,6 +762,31 @@ export default {
             // 每条消息估算高度 60px，乘以 5 倍缓冲确保快速滚动不会出现空白
             return Math.ceil(height / 60) * 5
         },
+        selectedMessageIds() {
+            const ids = new Set()
+            for (const message of this.msgsToForward || []) {
+                if (message) ids.add(messageIdKey(message._id))
+            }
+            return ids
+        },
+        unreadDividerMessageId() {
+            if (this.unreadDividerTargetId !== null && this.unreadDividerTargetId !== undefined) {
+                const targetId = messageIdKey(this.unreadDividerTargetId)
+                const target = this.messages.find((message) => message && messageIdKey(message._id) === targetId)
+                return target ? target._id : null
+            }
+
+            let remaining = this.unreadDividerCount
+            if (remaining <= 0) return null
+
+            for (let index = this.messages.length - 1; index >= 0; index--) {
+                const message = this.messages[index]
+                if (!message || message.system) continue
+                remaining--
+                if (remaining === 0) return message._id
+            }
+            return null
+        },
         audioRecordingStatus() {
             if (this.isAudioStarting) return '正在启动麦克风'
             if (this.isAudioRecording) return '正在录音'
@@ -757,6 +804,11 @@ export default {
             if (val) this.scheduleTextareaResize()
         },
         canLoadAfter(val) {
+            if (!val) {
+                // 到达最新消息后，向后请求可能返回空页，不能依赖 messages watcher 收尾。
+                this.settleTailLoading(false)
+                return
+            }
             // 当 canLoadAfter 变为 true 且已在底部时，自动触发加载
             if (
                 val &&
@@ -776,9 +828,6 @@ export default {
                 this.loadingMessages = true
                 this.scrollIcon = false
                 this.scrollMessagesCount = 0
-                this.scrollingTolastMessage = 0
-                this.scrollingToReplyMessage = null
-                this.scrollingToReplyMessageRetryCount = 0
                 //this.resetMessage(true)
 
                 this.editAndResend = false
@@ -788,21 +837,35 @@ export default {
             } else if (newVal.roomId === 0) {
                 this.scrollIcon = false
                 this.scrollMessagesCount = 0
-                this.scrollingTolastMessage = 0
-                this.scrollingToReplyMessage = null
-                this.scrollingToReplyMessageRetryCount = 0
             }
         },
         messages(newVal, oldVal) {
+            if (this.mouseSelecting) this.mouseSelectBounds = null
+            const currentSnapshot = {
+                length: newVal ? newVal.length : 0,
+                firstId: newVal && newVal.length ? newVal[0]._id : null,
+                lastId: newVal && newVal.length ? newVal[newVal.length - 1]._id : null,
+            }
+            const previousSnapshot =
+                oldVal === newVal
+                    ? this.messageListSnapshot
+                    : {
+                          length: oldVal ? oldVal.length : 0,
+                          firstId: oldVal && oldVal.length ? oldVal[0]._id : null,
+                          lastId: oldVal && oldVal.length ? oldVal[oldVal.length - 1]._id : null,
+                      }
+            this.messageListSnapshot = currentSnapshot
+
             const element = this.$refs.scrollContainer
             if (!element) return
 
-            const newLen = newVal ? newVal.length : 0
-            const oldLen = oldVal ? oldVal.length : 0
+            const newLen = currentSnapshot.length
+            const oldLen = previousSnapshot.length
             const offset = newLen - oldLen
+            const wasLoadingTailMessages = this.loadingTailMessages
 
             // 头部加载历史消息（最后一条消息相同 = 在前面插入了历史消息）
-            if (oldVal && oldLen && newVal && newLen && oldVal[oldLen - 1]._id === newVal[newLen - 1]._id) {
+            if (oldLen && newLen && previousSnapshot.lastId === currentSnapshot.lastId) {
                 const scrollTop = this.getTopScroll(element)
                 const scrollBottom = this.getBottomScroll(element)
                 if (scrollTop < scrollBottom) {
@@ -817,14 +880,29 @@ export default {
             }
 
             // 初始加载或不使用优化模式
-            if (!oldVal || !oldLen || this.optimizeMethod === 'none') {
+            if (!oldLen || this.optimizeMethod === 'none') {
                 this.visibleViewport.head = 0
                 this.visibleViewport.tail = newLen
             }
 
+            // 向后加载完成不能依赖消息数组一定有变化：空页和随后到达的单条新消息
+            // 都可能让后面的单条消息分支提前 return。
+            if (this.loadingTailMessages) {
+                const hasMore = this.canLoadAfter && newLen > oldLen
+                if (hasMore) {
+                    this.visibleViewport.tail = newLen
+                    this.visibleViewport.head = Math.max(0, this.visibleViewport.tail - this.maxViewportLength)
+                }
+                this.settleTailLoading(hasMore)
+            }
+
             // 新增单条消息
-            if (oldVal && newVal && oldLen === newLen - 1) {
+            if (oldLen === newLen - 1) {
                 this.loadingMessages = false
+
+                // A one-message final tail page is pagination, not a live message.
+                // Keep the current position instead of taking the generic auto-scroll path.
+                if (wasLoadingTailMessages) return
 
                 if (
                     newVal[newLen - 1].senderId === this.currentUserId ||
@@ -849,61 +927,18 @@ export default {
 
             if (this.infiniteState.head) {
                 this.infiniteState.head.loaded()
-            } else if (newVal && newLen && !this.scrollIcon && !(oldVal && newLen === oldLen) && !this.canLoadAfter) {
+            } else if (
+                newLen &&
+                !this.scrollIcon &&
+                newLen !== oldLen &&
+                !this.canLoadAfter &&
+                !wasLoadingTailMessages
+            ) {
                 // 不在 gotoMessage 模式时才自动滚动到底部
                 this.queueScrollToBottom()
             }
 
-            // 处理向下加载完成
-            if (this.loadingTailMessages) {
-                this.loadingTailMessages = false
-                if (this.infiniteState.tail) {
-                    if (newLen > oldLen) {
-                        // 有新消息加载，继续允许加载
-                        this.visibleViewport.tail = newLen
-                        this.visibleViewport.head = Math.max(0, this.visibleViewport.tail - this.maxViewportLength)
-                        this.infiniteState.tail.loaded()
-                    } else {
-                        // 没有新消息了，完成加载
-                        this.infiniteState.tail.complete()
-                    }
-                }
-            }
-
-            // 处理滚动到最后未读消息
-            if (this.checkCanScrollTimer) clearTimeout(this.checkCanScrollTimer)
-            if (this.scrollingTolastMessage) {
-                this.checkCanScrollTimer = setTimeout(() => {
-                    this.checkCanScrollTimer = null
-                    const nonSystemMessages = this.messages.filter((msg) => !msg.system)
-                    if (nonSystemMessages.length >= this.scrollingTolastMessage) {
-                        const msgCount = this.scrollingTolastMessage
-                        this.scrollingTolastMessage = 0
-                        setTimeout(() => {
-                            const _id = nonSystemMessages[nonSystemMessages.length - msgCount]._id
-                            if (!_id) {
-                                this.$message.error('Message not found')
-                                return
-                            }
-                            this.scrollToMessage(_id)
-                        }, 0)
-                    }
-                }, 1000)
-            }
-
-            // 处理回复消息的定位
-            if (this.scrollingToReplyMessage) {
-                setTimeout(() => {
-                    const result = this.scrollToMessage(this.scrollingToReplyMessage, false, true)
-                    if (result) {
-                        // 成功定位，清除状态
-                        this.scrollingToReplyMessage = null
-                        this.scrollingToReplyMessageRetryCount = 0
-                    }
-                }, 1000)
-            }
-
-            setTimeout(() => (this.loadingHeadMessages = false), 0)
+            this.lifecycleScope.timeout(() => (this.loadingHeadMessages = false), 0)
         },
         messagesLoaded(val) {
             if (val) this.loadingMessages = false
@@ -917,10 +952,9 @@ export default {
         },
     },
     async mounted() {
-        this.newMessages = []
         this.restoreMessageDraft()
 
-        window.addEventListener('paste', (event) => {
+        this.lifecycleScope.onEvent(window, 'paste', (event) => {
             console.log(event.clipboardData.files)
             const imageHTML = event.clipboardData.getData('text/html') || '.'
             console.log(imageHTML)
@@ -946,7 +980,7 @@ export default {
         })
 
         //drag and drop https://www.geeksforgeeks.org/drag-and-drop-files-in-electronjs/
-        document.addEventListener('drop', (event) => {
+        this.lifecycleScope.onEvent(document, 'drop', (event) => {
             event.preventDefault()
             event.stopPropagation()
             console.log(event)
@@ -955,7 +989,6 @@ export default {
                 if (event.target.className === 'vac-textarea') {
                     this.appendMessageText(event.dataTransfer.getData('text'))
                     this.focusTextarea()
-                    this.$nextTick(() => this.resizeTextarea())
                 }
             }
             if (event.dataTransfer.files.length) {
@@ -984,50 +1017,49 @@ export default {
         })
     },
     async created() {
+        this.lifecycleScope = createRendererLifecycleScope()
         this.optimizeMethod = await ipc.getOptimizeMethodSetting()
         if (this.$route.name === 'history-page' || this.$route.name === 'member-history-page')
             this.optimizeMethod = 'none'
         keyToSendMessage = await ipc.getKeyToSendMessage()
-        ipcRenderer.on('setOptimizeMethodSetting', (_, method) => (this.optimizeMethod = method))
-        ipcRenderer.on('startForward', (_, _id) => {
+        this.lifecycleScope.onIpc('setOptimizeMethodSetting', (_, method) => (this.optimizeMethod = method))
+        this.lifecycleScope.onIpc('startForward', (_, _id) => {
             if (this.showForwardPanel) return
-            this.selectedMessage = _id
-            this.msgsToForward.push(_id)
-            this.selectUpdateKey = 1
+            const message = this.findMessageById(_id)
+            if (!message) return
+            this.msgsToForward = [message]
             this.showForwardPanel = true
         })
-        ipcRenderer.on('replyMessage', (_, message) => this.replyMessage(message))
-        ipcRenderer.on('setKeyToSendMessage', (_, key) => {
+        this.lifecycleScope.onIpc('replyMessage', (_, message) => this.replyMessage(message))
+        this.lifecycleScope.onIpc('setKeyToSendMessage', (_, key) => {
             keyToSendMessage = key
         })
-        ipcRenderer.on('addMessageText', (_, message) => {
+        this.lifecycleScope.onIpc('addMessageText', (_, message) => {
             this.appendMessageText(message)
             this.focusTextarea()
-            this.$nextTick(() => this.resizeTextarea())
         })
-        ipcRenderer.on('setMessageText', (_, message) => {
+        this.lifecycleScope.onIpc('setMessageText', (_, message) => {
             this.setMessageText(message)
             this.focusTextarea()
-            this.$nextTick(() => this.resizeTextarea())
         })
-        ipcRenderer.on('pasteGif', (_, GifURL) => {
+        this.lifecycleScope.onIpc('pasteGif', (_, GifURL) => {
             this.onPasteGif(GifURL)
             this.$emit('close-stickers-panel')
         })
         this.hideChatImageByDefault = await ipc.getHideChatImageByDefault()
-        ipcRenderer.on('setHideChatImageByDefault', (_, hideChatImageByDefault) => {
+        this.lifecycleScope.onIpc('setHideChatImageByDefault', (_, hideChatImageByDefault) => {
             this.hideChatImageByDefault = hideChatImageByDefault
         })
         this.hideChatVideoByDefault = await ipc.getHideChatVideoByDefault()
-        ipcRenderer.on('setHideChatVideoByDefault', (_, hideChatVideoByDefault) => {
+        this.lifecycleScope.onIpc('setHideChatVideoByDefault', (_, hideChatVideoByDefault) => {
             this.hideChatVideoByDefault = hideChatVideoByDefault
         })
         this.localImageViewerByDefault = (await ipc.getSettings()).localImageViewerByDefault
-        ipcRenderer.on('setLocalImageViewerByDefault', (_, localImageViewerByDefault) => {
+        this.lifecycleScope.onIpc('setLocalImageViewerByDefault', (_, localImageViewerByDefault) => {
             this.localImageViewerByDefault = localImageViewerByDefault
         })
         this.disableQLottie = (await ipc.getSettings()).disableQLottie
-        ipcRenderer.on('setDisableQLottie', (_, a) => {
+        this.lifecycleScope.onIpc('setDisableQLottie', (_, a) => {
             this.disableQLottie = a
         })
         const isAdapter = (await ipc.getSettings()).adapter === 'socketIo'
@@ -1036,28 +1068,37 @@ export default {
         } else {
             this.recordPath = 'file://' + (await ipc.getStorePath()) + '/records'
         }
-        ipcRenderer.on('forwardSingleMessage', (_, _id) => {
+        this.lifecycleScope.onIpc('forwardSingleMessage', (_, _id) => {
+            const message = this.findMessageById(_id)
+            if (!message) return
             this.showForwardPanel = true
-            this.selectedMessage = _id
-            this.msgsToForward.push(_id)
-            this.selectUpdateKey = 1
+            this.addmsgToForward(message)
         })
     },
     beforeDestroy() {
+        this.scrollToBottomGeneration++
+        this.lifecycleScope?.dispose()
+        this.textareaResizeScheduled = false
         this.saveMessageDraft(this.getMessageText(), true)
         this.disposeAudioRecorder()
         if (this.onScrolling) {
-            clearTimeout(this.onScrolling)
+            this.lifecycleScope.cancelTimeout(this.onScrolling)
             this.onScrolling = null
         }
         if (this.scrollToBottomTimer) {
-            cancelAnimationFrame(this.scrollToBottomTimer)
+            this.lifecycleScope.cancelAnimationFrame(this.scrollToBottomTimer)
             this.scrollToBottomTimer = null
         }
-        if (this.checkCanScrollTimer) {
-            clearTimeout(this.checkCanScrollTimer)
-            this.checkCanScrollTimer = null
+        if (this.mouseSelectFrame !== null) {
+            this.lifecycleScope.cancelAnimationFrame(this.mouseSelectFrame)
+            this.mouseSelectFrame = null
         }
+        if (this.mouseSelecting) {
+            window.removeEventListener('mousemove', this.continueMouseSelect)
+            window.removeEventListener('mouseup', this.endMouseSelect)
+            this.mouseSelecting = false
+        }
+        this.mouseSelectBounds = null
         this.clearAudioSessions()
     },
     methods: {
@@ -1134,14 +1175,14 @@ export default {
         },
         startAudioDurationTimer() {
             this.stopAudioDurationTimer()
-            this.audioDurationTimer = setInterval(() => {
+            this.audioDurationTimer = this.lifecycleScope.interval(() => {
                 if (!this.isAudioRecording) return
                 this.audioDuration = (Date.now() - this.audioRecordingStartedAt) / 1000
             }, 200)
         },
         stopAudioDurationTimer() {
             if (!this.audioDurationTimer) return
-            clearInterval(this.audioDurationTimer)
+            this.lifecycleScope.cancelInterval(this.audioDurationTimer)
             this.audioDurationTimer = null
         },
         formatAudioDuration(seconds) {
@@ -1279,7 +1320,7 @@ export default {
             this.pendingMessageDraft = message == null ? '' : String(message)
             if (immediate) {
                 if (this.messageDraftSaveTimer) {
-                    clearTimeout(this.messageDraftSaveTimer)
+                    this.lifecycleScope.cancelTimeout(this.messageDraftSaveTimer)
                     this.messageDraftSaveTimer = null
                 }
                 this.persistMessageDraft()
@@ -1287,7 +1328,7 @@ export default {
             }
 
             if (this.messageDraftSaveTimer) return
-            this.messageDraftSaveTimer = setTimeout(() => {
+            this.messageDraftSaveTimer = this.lifecycleScope.timeout(() => {
                 this.messageDraftSaveTimer = null
                 this.persistMessageDraft()
             }, messageDraftThrottleMs)
@@ -1314,8 +1355,15 @@ export default {
             this.scheduleTextareaResize()
         },
         scheduleTextareaResize() {
+            if (this.textareaResizeScheduled) return
+            this.textareaResizeScheduled = true
             this.$nextTick(() => {
-                requestAnimationFrame(() => this.resizeTextarea())
+                if (!this.textareaResizeScheduled) return
+                const frame = this.lifecycleScope.animationFrame(() => {
+                    this.textareaResizeScheduled = false
+                    this.resizeTextarea()
+                })
+                if (frame === null) this.textareaResizeScheduled = false
             })
         },
         appendMessageText(message) {
@@ -1459,15 +1507,14 @@ export default {
                 return
             }
             const ForwardMessages = []
+            const forwardedMessageIds = new Set()
+            for (const message of this.msgsToForward || []) {
+                const key = messageIdKey(message._id)
+                if (forwardedMessageIds.has(key)) continue
+                forwardedMessageIds.add(key)
+                ForwardMessages.push(message)
+            }
             const dm = target > 0
-
-            this.messages.forEach((message) => {
-                this.msgsToForward.forEach((msgId) => {
-                    if (message._id === msgId) {
-                        ForwardMessages.push(message)
-                    }
-                })
-            })
             const messagesToSend = []
             ForwardMessages.forEach((msg) => {
                 const singleMessage = {
@@ -1642,7 +1689,7 @@ export default {
             if (!multi) {
                 messagesToSend.forEach((msg, index) => {
                     console.log(msg.message)
-                    setTimeout(
+                    this.lifecycleScope.timeout(
                         () => {
                             this.$emit('send-message', {
                                 roomId: target,
@@ -1663,18 +1710,38 @@ export default {
             this.closeForwardPanel()
         },
         closeForwardPanel() {
-            this.selectUpdateKey = 0
             this.showForwardPanel = false
             this.msgsToForward = []
-            this.selectedMessage = ''
             console.log('closeForwardPanel')
         },
-        addmsgToForward(messageId) {
-            this.msgsToForward.push(messageId)
+        findMessageById(messageId) {
+            const key = messageIdKey(messageId)
+            return this.messages.find((message) => message && messageIdKey(message._id) === key)
+        },
+        addmsgToForward(message) {
+            const selectedMessage = message && typeof message === 'object' ? message : this.findMessageById(message)
+            if (!selectedMessage) return
+            const key = messageIdKey(selectedMessage._id)
+            if (!this.selectedMessageIds.has(key)) {
+                const nextMessages = this.msgsToForward.slice()
+                let low = 0
+                let high = nextMessages.length
+                while (low < high) {
+                    const middle = (low + high) >>> 1
+                    if (compareMessageOrder(nextMessages[middle], selectedMessage) <= 0) low = middle + 1
+                    else high = middle
+                }
+                nextMessages.splice(low, 0, selectedMessage)
+                this.msgsToForward = nextMessages
+            }
             console.log('addmsgToForward')
         },
-        delmsgToForward(messageId) {
-            this.msgsToForward = this.msgsToForward.filter((e) => e !== messageId)
+        delmsgToForward(message) {
+            const messageId = message && typeof message === 'object' ? message._id : message
+            const key = messageIdKey(messageId)
+            this.msgsToForward = this.msgsToForward.filter(
+                (selectedMessage) => selectedMessage && messageIdKey(selectedMessage._id) !== key,
+            )
             if (this.msgsToForward.length === 0) {
                 this.closeForwardPanel()
             }
@@ -1686,37 +1753,39 @@ export default {
             if (message) {
                 message.scrollIntoView({ behavior: 'smooth', block: 'center' })
                 message.parentElement.style = 'background: var(--chat-message-bg-color-reply)'
-                setTimeout(() => {
+                this.lifecycleScope.timeout(() => {
                     message.parentElement.style = ''
                 }, 200)
             }
         },
         scrollToMessage(messageId, autoLoad = false, isRetry = false) {
+            this.cancelQueuedScrollToBottom()
+            const targetMessageId = String(messageId)
             let judgeSameMessage = () => false
-            const parsed = Buffer.from(String(messageId), 'base64')
+            const parsed = Buffer.from(targetMessageId, 'base64')
             let messageSeq = 0
             try {
-                if (messageId.length === 28) {
+                if (parsed.length === 21) {
                     //group
                     messageSeq = parsed.readUInt32BE(8)
-                } else {
+                } else if (parsed.length === 17) {
                     //c2c
                     messageSeq = parsed.readUInt32BE(4)
                 }
             } catch (e) {}
             if (this.$route.name === 'history-page' || this.$route.name === 'member-history-page') {
                 judgeSameMessage = (a) => {
-                    const seqA = Number(a.split('|')[1])
+                    const seqA = Number(String(a).split('|')[1])
                     if (seqA !== messageSeq) return false
                     return true
                 }
             } else {
-                const parsedB = Buffer.from(messageId, 'base64')
+                const parsedB = parsed
                 judgeSameMessage = (a) => {
                     //shitcode?
-                    if (a === messageId) return true
+                    if (String(a) === targetMessageId) return true
                     try {
-                        const parsedA = Buffer.from(a, 'base64')
+                        const parsedA = Buffer.from(String(a), 'base64')
                         if (this.roomId < 0) {
                             // 群消息 ID 格式: | groupId(0) | senderId(4) | seq(8) | random(12) | time(16) | pktnum(20) |
                             // 如果 senderId 或 time 为 0（milky 适配器），则跳过这些字段的比较
@@ -1744,11 +1813,12 @@ export default {
                     } catch (e) {}
                 }
             }
-            const message = document.getElementById(messageId)
+            const message = document.getElementById(targetMessageId)
             if (message) {
-                message.scrollIntoView()
+                const scrollTarget = message.parentElement || message
+                scrollTarget.scrollIntoView()
                 message.parentElement.style = 'background: var(--chat-message-bg-color-reply)'
-                setTimeout(() => {
+                this.lifecycleScope.timeout(() => {
                     message.parentElement.style = ''
                 }, 3000)
                 return true
@@ -1770,9 +1840,10 @@ export default {
                     this.$nextTick(() => {
                         const el = document.getElementById(this.messages[index]._id)
                         if (el) {
-                            el.scrollIntoView()
+                            const scrollTarget = el.parentElement || el
+                            scrollTarget.scrollIntoView()
                             el.parentElement.style = 'background: var(--chat-message-bg-color-reply)'
-                            setTimeout(() => {
+                            this.lifecycleScope.timeout(() => {
                                 el.parentElement.style = ''
                             }, 3000)
                         }
@@ -1781,27 +1852,10 @@ export default {
                 }
             }
 
-            // 消息未找到，尝试自动加载
+            // 回复消息未找到时，由外层先尝试加载附近历史，再按需切换到稳定的中间窗口。
             if (autoLoad && !isRetry) {
-                const maxRetries = 10
-                if (
-                    this.scrollingToReplyMessageRetryCount < maxRetries &&
-                    !(this.$route.name === 'history-page' || this.$route.name === 'member-history-page')
-                ) {
-                    this.scrollingToReplyMessageRetryCount++
-                    const loadCount = 200 // 每次加载200条消息
-                    console.log(
-                        `被回复的消息不在当前列表中，正在加载历史消息 (${this.scrollingToReplyMessageRetryCount}/${maxRetries})...`,
-                    )
-                    this.$message.info('尝试加载历史消息...')
-                    this.$emit('fetch-messages', false, loadCount)
-                    this.scrollingToReplyMessage = messageId
-                    return false
-                } else {
-                    // 达到最大重试次数
-                    this.scrollingToReplyMessage = null
-                    this.scrollingToReplyMessageRetryCount = 0
-                    this.$message.error('被回复的消息太远啦')
+                if (!(this.$route.name === 'history-page' || this.$route.name === 'member-history-page')) {
+                    this.$emit('locate-message', messageId)
                     return false
                 }
             }
@@ -1827,9 +1881,6 @@ export default {
                 width: width + 26,
             }
         },
-        addNewMessage(message) {
-            this.newMessages.push(message)
-        },
         resetMessage(disableMobileFocus = null, editFile = null) {
             this.$emit('typing-message', null)
 
@@ -1852,7 +1903,7 @@ export default {
             this.emojiOpened = false
             this.editAndResend = false
             this.preventKeyboardFromClosing()
-            setTimeout(() => this.focusTextarea(disableMobileFocus), 0)
+            this.lifecycleScope.timeout(() => this.focusTextarea(disableMobileFocus), 0)
         },
         async paste() {
             this.appendMessageText(await navigator.clipboard.readText())
@@ -1880,7 +1931,7 @@ export default {
             this.editedMessage.file = null
             this.files = []
             this.focusTextarea()
-            this.$nextTick(() => this.resizeTextarea())
+            this.scheduleTextareaResize()
         },
         removeImage(idx) {
             this.imageFiles.splice(idx, 1)
@@ -1922,7 +1973,7 @@ export default {
             if (typeof id === 'string') {
                 this.useMessageContent(`[Face: ${id}]`)
             }
-            setTimeout(() => this.focusTextarea(), 0)
+            this.lifecycleScope.timeout(() => this.focusTextarea(), 0)
         },
         closeQuickAt() {
             this.isQuickAtOn = false
@@ -1948,14 +1999,14 @@ export default {
                 this.useMessageContent((this.useAtKey ? atName : atText) + ' ')
             }
             this.useAtKey = false
-            setTimeout(() => this.focusTextarea(), 0)
+            this.lifecycleScope.timeout(() => this.focusTextarea(), 0)
         },
         nomatchQuickAt(search) {
             if (!this.useAtKey) return
             this.isQuickAtOn = false
             this.useAtKey = false
             this.useMessageContent(search)
-            setTimeout(() => this.focusTextarea(), 0)
+            this.lifecycleScope.timeout(() => this.focusTextarea(), 0)
         },
         async sendMessage() {
             const message = this.getMessageText()
@@ -2029,7 +2080,7 @@ export default {
             this.resetMessage(true)
         },
         loadMoreMessages() {
-            setTimeout(
+            this.lifecycleScope.timeout(
                 () => {
                     if (this.loadingHeadMessages) return
                     if (!this.messages || this.messages.length === 0) return
@@ -2091,10 +2142,10 @@ export default {
 
                 if (isImageFile(message.file)) {
                     this.imageFiles = [message.file.url]
-                    setTimeout(() => this.onMediaLoad(), 0)
+                    this.lifecycleScope.timeout(() => this.onMediaLoad(), 0)
                 } else if (isVideoFile(message.file)) {
                     this.videoFiles = [message.file.url]
-                    setTimeout(() => this.onMediaLoad(), 50)
+                    this.lifecycleScope.timeout(() => this.onMediaLoad(), 50)
                 }
             }
 
@@ -2109,16 +2160,25 @@ export default {
             return scrollHeight - clientHeight - scrollTop
         },
         scrollToBottom() {
+            if (this.canLoadAfter) {
+                this.$emit('return-to-latest')
+                return
+            }
             this.queueScrollToBottom(true)
+        },
+        cancelQueuedScrollToBottom() {
+            this.scrollToBottomGeneration++
+            if (this.scrollToBottomTimer) {
+                this.lifecycleScope.cancelAnimationFrame(this.scrollToBottomTimer)
+                this.scrollToBottomTimer = null
+            }
         },
         queueScrollToBottom(smooth = false) {
             const element = this.$refs.scrollContainer
             if (!element) return
             this.loadingMessages = false
-            if (this.scrollToBottomTimer) {
-                cancelAnimationFrame(this.scrollToBottomTimer)
-                this.scrollToBottomTimer = null
-            }
+            this.cancelQueuedScrollToBottom()
+            const generation = this.scrollToBottomGeneration
             if (this.optimizeMethod !== 'none') {
                 this.visibleViewport.tail = this.messages.length
                 this.visibleViewport.head = Math.max(this.messages.length - this.maxViewportLength, 0)
@@ -2126,28 +2186,21 @@ export default {
             this.scrollMessagesCount = 0
             this.scrollIcon = false
             this.$nextTick(() => {
-                this.scrollToBottomTimer = requestAnimationFrame(() => {
+                if (generation !== this.scrollToBottomGeneration) return
+                this.scrollToBottomTimer = this.lifecycleScope.animationFrame(() => {
+                    if (generation !== this.scrollToBottomGeneration) return
                     this.scrollToBottomTimer = null
                     element.scrollTo({ top: element.scrollHeight, behavior: smooth ? 'smooth' : 'auto' })
                 })
             })
         },
         async scrollToLastMessage() {
-            if (this.lastUnreadCount > 100) {
-                this.$message('加载消息中，请耐心等待')
-            }
             const lastUnreadCount = this.lastUnreadCount
             if (lastUnreadCount === 0) return
-            const fetchNumber = Math.max(lastUnreadCount - this.messages.filter((e) => !e.system).length, 0)
-            console.log('Need fetch messages: ', fetchNumber)
-            this.$emit('fetch-messages', false, fetchNumber)
             this.$emit('clear-last-unread-count')
-            this.scrollingTolastMessage = lastUnreadCount
+            this.$emit('locate-unread-message', lastUnreadCount)
         },
         async scrollToLastAtMessage() {
-            if (this.lastUnreadCount > 100) {
-                this.$message('加载消息中，请耐心等待')
-            }
             this.$emit('clear-last-unread-at')
         },
         onChangeInput(event) {
@@ -2155,7 +2208,7 @@ export default {
             this.keepKeyboardOpen = true
             this.saveMessageDraft(message, !message)
             this.updateMessageEmptyState(message)
-            this.resizeTextarea()
+            this.scheduleTextareaResize()
             this.$emit('typing-message', message)
             const selectionStart = this.$refs.roomTextarea.selectionStart
             if (
@@ -2201,17 +2254,13 @@ export default {
                         console.error(e)
                     }
                 }
-                const fileURL = filePath ? filePath : URL.createObjectURL(file)
-                const blobFile = await fetch(fileURL).then((res) => res.blob())
                 const typeIndex = file.name.lastIndexOf('.')
 
                 const fileObj = {
-                    blob: blobFile,
                     name: file.name.substring(0, typeIndex),
                     size: file.size,
                     type: file.type,
                     extension: file.name.substring(typeIndex + 1),
-                    localUrl: fileURL,
                     path: filePath,
                 }
                 const extension = fileObj.extension.toLowerCase()
@@ -2225,21 +2274,31 @@ export default {
                     fileObj.type = ''
                 }
                 if (force) fileObj.type = ''
+
+                const isImage = isImageFile(fileObj)
+                const isVideo = isVideoFile(fileObj)
+                const isAudio = isAudioFile(fileObj)
+                const fileURL = filePath || (isImage || isVideo || isAudio ? URL.createObjectURL(file) : '')
+                fileObj.localUrl = fileURL
+
+                // File 本身就是惰性 Blob。仅图片和音频在发送阶段需要读取内容；
+                // 普通文件与视频走路径上传，避免添加附件时把大文件完整读入渲染进程。
+                if (isImage || isAudio) fileObj.blob = file
                 this.files.push(fileObj)
 
-                if (isImageFile(fileObj)) {
+                if (isImage) {
                     this.imageFiles.push(fileURL)
-                } else if (isVideoFile(fileObj)) {
+                } else if (isVideo) {
                     this.resetMediaFile()
                     this.files = [fileObj]
                     this.videoFiles.push(fileURL)
-                    setTimeout(() => this.onMediaLoad(), 50)
+                    this.lifecycleScope.timeout(() => this.onMediaLoad(), 50)
                     break
-                } else if (isAudioFile(fileObj)) {
+                } else if (isAudio) {
                     this.resetMediaFile()
                     this.files = [fileObj]
                     this.videoFiles.push(fileURL)
-                    setTimeout(() => this.onMediaLoad(), 50)
+                    this.lifecycleScope.timeout(() => this.onMediaLoad(), 50)
                     break
                 } else {
                     this.resetMediaFile()
@@ -2249,7 +2308,7 @@ export default {
                 }
             }
 
-            setTimeout(() => {
+            this.lifecycleScope.timeout(() => {
                 this.fileDialog = false
                 this.focusTextarea()
             }, 500)
@@ -2273,7 +2332,7 @@ export default {
 
             this.files.push(fileObj)
             this.imageFiles.push(fileURL)
-            setTimeout(() => {
+            this.lifecycleScope.timeout(() => {
                 this.fileDialog = false
                 this.focusTextarea()
             }, 500)
@@ -2302,11 +2361,12 @@ export default {
             ipc.popupAvatarMenu(_message, this.room, e)
         },
         containerScroll(e) {
+            if (this.mouseSelecting) this.mouseSelectBounds = null
             if (this.onScrolling) {
-                clearTimeout(this.onScrolling)
+                this.lifecycleScope.cancelTimeout(this.onScrolling)
                 this.onScrolling = null
             }
-            this.onScrolling = setTimeout(() => {
+            this.onScrolling = this.lifecycleScope.timeout(() => {
                 this.onScrolling = null
                 if (!e.target) return
 
@@ -2345,7 +2405,7 @@ export default {
         },
         loadHeadMessages(infiniteState) {
             if (this.optimizeMethod !== 'infinite-loading') return
-            setTimeout(
+            this.lifecycleScope.timeout(
                 () => {
                     this.infiniteState.head = infiniteState
                     if (this.loadingHeadMessages && this.visibleViewport.head === 0) return
@@ -2368,6 +2428,15 @@ export default {
                 iOSDevice() ? 500 : 0,
             )
         },
+        settleTailLoading(hasMore) {
+            const infiniteState = this.infiniteState.tail
+            this.loadingTailMessages = false
+            this.infiniteState.tail = null
+
+            if (!infiniteState) return
+            if (hasMore) infiniteState.loaded()
+            else infiniteState.complete()
+        },
         loadTailMessages(infiniteState) {
             if (this.optimizeMethod !== 'infinite-loading') return
             if (this.loadingTailMessages) return
@@ -2386,7 +2455,7 @@ export default {
             }
         },
         _loadMoreMessages(infiniteState) {
-            setTimeout(
+            this.lifecycleScope.timeout(
                 () => {
                     if (this.loadingHeadMessages) return
                     if (this.messagesLoaded || !this.room.roomId) {
@@ -2430,7 +2499,7 @@ export default {
                     return
                 }
                 this.membersCount = group.member_count
-                const gms = await ipc.getGroupMembers(-roomId)
+                const gms = await groupMemberCache.getGroupMembers(-roomId, true)
                 const ownerMembers = []
                 const adminMembers = []
                 const normalMembers = []
@@ -2452,40 +2521,88 @@ export default {
                 this.groupMembers = groupMembers
             } else this.membersCount = 0
         },
+        refreshMouseSelectBounds() {
+            const container = this.$refs.messagesContainer
+            if (!container) {
+                this.mouseSelectBounds = []
+                return
+            }
+
+            this.mouseSelectBounds = [...container.querySelectorAll('.vac-message-box')]
+                .map((msgBox) => {
+                    const msgCard = msgBox.querySelector('.vac-message-card')
+                    if (!msgCard) return null
+                    const { x, y, width, height } = msgCard.getBoundingClientRect()
+                    return {
+                        id: msgBox.id,
+                        x1: x,
+                        y1: y,
+                        x2: x + width,
+                        y2: y + height,
+                    }
+                })
+                .filter(Boolean)
+        },
         updateMouseSelectAreaStyleImmediately() {
             const el = this.$refs.mouseSelectArea
-            if (!el) return
-
             const area = this.mouseSelectArea
-            el.style.left = Math.min(area.x1, area.x2) + 'px'
-            el.style.top = Math.min(area.y1, area.y2) + 'px'
-            el.style.width = Math.abs(area.x1 - area.x2) + 'px'
-            el.style.height = Math.abs(area.y1 - area.y2) + 'px'
+            if (!el || !area) return
 
-            const container = this.$refs.messagesContainer
-            const selectedIds = [...container.querySelectorAll('.vac-message-box')]
-                .filter((msgBox) => {
-                    const msgCard = msgBox.querySelector('.vac-message-card')
-                    const { x: x1, y: y1, width: w, height: h } = msgCard.getBoundingClientRect()
-                    const x2 = x1 + w,
-                        y2 = y1 + h
-                    const [ax1, ax2] = [area.x1, area.x2].sort((a, b) => a - b)
-                    const [ay1, ay2] = [area.y1, area.y2].sort((a, b) => a - b)
-                    if (ax2 < x1 || x2 < ax1 || ay2 < y1 || y2 < ay1) return false
-                    return true
-                })
-                .map((msgBox) => msgBox.id)
+            const ax1 = Math.min(area.x1, area.x2)
+            const ax2 = Math.max(area.x1, area.x2)
+            const ay1 = Math.min(area.y1, area.y2)
+            const ay2 = Math.max(area.y1, area.y2)
+            el.style.left = ax1 + 'px'
+            el.style.top = ay1 + 'px'
+            el.style.width = ax2 - ax1 + 'px'
+            el.style.height = ay2 - ay1 + 'px'
 
-            if (!_.isEqual(selectedIds, this.mouseSelectIds)) {
-                this.$nextTick(() => {
-                    this.selectUpdateKey++
-                    this.msgsToForward = this.msgsToForward.filter((id) => !this.mouseSelectIds.includes(id))
-                    selectedIds.forEach((id) => {
-                        if (!this.msgsToForward.includes(id)) this.msgsToForward.push(id)
-                    })
-                    this.mouseSelectIds = selectedIds
-                })
+            if (this.mouseSelectBounds === null) this.refreshMouseSelectBounds()
+            const selectedIds = (this.mouseSelectBounds || [])
+                .filter((bound) => !(ax2 < bound.x1 || bound.x2 < ax1 || ay2 < bound.y1 || bound.y2 < ay1))
+                .map((bound) => bound.id)
+            const currentIds = this.mouseSelectIds || []
+            const selectionUnchanged =
+                selectedIds.length === currentIds.length && selectedIds.every((id, index) => id === currentIds[index])
+            if (selectionUnchanged) return
+
+            const oldMouseSelectIds = new Set(currentIds.map((id) => messageIdKey(id)))
+            const nextForwardIds = new Set()
+            const nextForwardMessages = []
+            for (const message of this.msgsToForward || []) {
+                if (!message) continue
+                const key = messageIdKey(message._id)
+                if (!oldMouseSelectIds.has(key) && !nextForwardIds.has(key)) {
+                    nextForwardIds.add(key)
+                    nextForwardMessages.push(message)
+                }
             }
+            const messagesById = new Map(this.messages.map((message) => [messageIdKey(message._id), message]))
+            for (const id of selectedIds) {
+                const key = messageIdKey(id)
+                const message = messagesById.get(key)
+                if (message && !nextForwardIds.has(key)) {
+                    nextForwardIds.add(key)
+                    nextForwardMessages.push(message)
+                }
+            }
+
+            this.msgsToForward = nextForwardMessages.sort(compareMessageOrder)
+            this.mouseSelectIds = selectedIds
+        },
+        scheduleMouseSelectUpdate() {
+            if (this.mouseSelectFrame !== null) return
+            this.mouseSelectFrame = this.lifecycleScope.animationFrame(() => {
+                this.mouseSelectFrame = null
+                if (this.mouseSelecting) this.updateMouseSelectAreaStyleImmediately()
+            })
+        },
+        flushMouseSelectUpdate() {
+            if (this.mouseSelectFrame !== null) {
+                this.lifecycleScope.cancelAnimationFrame(this.mouseSelectFrame)
+                this.mouseSelectFrame = null
+            }
+            this.updateMouseSelectAreaStyleImmediately()
         },
         startMouseSelect(e) {
             if (this.$route.name === 'history-page' || this.$route.name === 'member-history-page') return
@@ -2508,6 +2625,7 @@ export default {
                 y2: y,
             }
             this.mouseSelectIds = []
+            this.mouseSelectBounds = null
 
             this.updateMouseSelectAreaStyleImmediately()
         },
@@ -2519,12 +2637,15 @@ export default {
             this.mouseSelectArea.x2 = x
             this.mouseSelectArea.y2 = y
 
-            this.updateMouseSelectAreaStyleImmediately()
+            this.scheduleMouseSelectUpdate()
         },
         endMouseSelect(e) {
             if (!this.mouseSelecting) return
 
-            this.continueMouseSelect(e)
+            const { pageX: x, pageY: y } = e
+            this.mouseSelectArea.x2 = x
+            this.mouseSelectArea.y2 = y
+            this.flushMouseSelectUpdate()
 
             this.mouseSelecting = false
 
@@ -2534,6 +2655,7 @@ export default {
             if (this.mouseSelectIds.length) {
                 this.showForwardPanel = true
             }
+            this.mouseSelectBounds = null
         },
         async openImage(src) {
             if (this.imageFiles.length > 1) {
@@ -2542,11 +2664,57 @@ export default {
                 ipcRenderer.send('openImage', src, this.localImageViewerByDefault)
             }
         },
+        async openMessageImage({ url, messageId, imageIndex }) {
+            const messages = this.messages
+            const { singleImageMode } = await ipc.getSettings()
+            if (singleImageMode || this.localImageViewerByDefault) {
+                ipcRenderer.send('openImage', url, this.localImageViewerByDefault)
+                return
+            }
+
+            const images = []
+            for (const message of messages) {
+                if (message.files) {
+                    for (let index = 0; index < message.files.length; index++) {
+                        const file = message.files[index]
+                        if (file.type && file.type.startsWith('image')) {
+                            images.push(`${file.url}&message_id=${message._id}&img_index=${index}`)
+                        }
+                    }
+                } else if (message.file && message.file.type && message.file.type.startsWith('image')) {
+                    images.push(`${message.file.url}&message_id=${message._id}&img_index=0`)
+                }
+            }
+
+            const imageUrl = `${url}&message_id=${messageId}&img_index=${imageIndex}`
+            ipcRenderer.send('openImage', imageUrl, false, images)
+        },
     },
 }
 </script>
 
 <style lang="scss">
+.quick-at-avatar {
+    flex: 0 0 auto;
+    margin-right: 5px;
+}
+
+.quick-at-name {
+    min-width: 0;
+    flex: 1 1 auto;
+    margin: 4px 0 0;
+    overflow-y: visible;
+    overflow-x: clip;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.quick-at-id {
+    flex: 0 0 auto;
+    margin: 4px 0 0;
+    font-family: monospace;
+}
+
 .vac-container-center {
     height: 100%;
     width: 100%;

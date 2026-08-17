@@ -2,7 +2,6 @@ import BilibiliMiniApp from '@icalingua/types/BilibiliMiniApp'
 import LastMessage from '@icalingua/types/LastMessage'
 import Message from '@icalingua/types/Message'
 import StructMessageCard from '@icalingua/types/StructMessageCard'
-import { base64decode } from 'nodejs-base64'
 import { AtElem, FriendInfo, GroupMessageEventData, MemberBaseInfo, MessageElem } from 'oicq-icalingua-plus-plus'
 import path from 'path'
 import getImageUrlByMd5 from '../../utils/getImageUrlByMd5'
@@ -20,6 +19,15 @@ type SilkDecodeCompleter = {
     renewMessage: (roomId: number, messageId: string, message: Partial<Message>) => void
     getMessage?: (roomId: number, messageId: string) => Promise<Message | null>
 }
+
+const base64decode = (str: string): string => {
+    if (typeof str !== 'string') {
+        throw new Error('Input value must be a string.')
+    }
+    return Buffer.from(str, 'base64').toString('utf8')
+}
+
+const getErrorMessage = (error: unknown) => (error instanceof Error ? error.message : String(error))
 
 let silkDecodeCompleter: SilkDecodeCompleter | null = null
 
@@ -72,7 +80,7 @@ const scheduleAsyncSilkDecode = (roomId: number, message: Message, url: string, 
                 message.content = clearDecodingPlaceholderContent(message.content)
             } catch (e) {
                 errorHandler(e, true)
-                message.content = '[语音转换失败]' + (e as Error).message + '\n' + url
+                message.content = '[语音转换失败]' + getErrorMessage(e) + '\n' + url
             }
             return
         }
@@ -109,7 +117,7 @@ const scheduleAsyncSilkDecode = (roomId: number, message: Message, url: string, 
             })
         } catch (e) {
             errorHandler(e, true)
-            message.content = '[语音转换失败]' + (e as Error).message + '\n' + url
+            message.content = '[语音转换失败]' + getErrorMessage(e) + '\n' + url
             try {
                 await completer.replaceMessage(roomId, messageId, message)
                 completer.renewMessage(roomId, String(messageId), {
@@ -195,6 +203,7 @@ const processMessage = async (
                     type: 'image/jpeg',
                     url,
                     order: message.content.length,
+                    isFace: m.data.type === 'face',
                 }
                 message.files.push(message.file)
                 break
@@ -208,6 +217,7 @@ const processMessage = async (
                     type: 'image/webp',
                     url,
                     order: message.content.length,
+                    isFace: true,
                 }
                 message.files.push(message.file)
                 break
@@ -230,11 +240,11 @@ const processMessage = async (
             case 'reply':
                 let user_id: number, time: number
                 const parsed = Buffer.from(m.data.id, 'base64')
-                if (m.data.id.length > 24) {
+                if (parsed.length === 21) {
                     // Group
                     user_id = parsed.readUInt32BE(4)
                     time = parsed.readUInt32BE(16)
-                } else {
+                } else if (parsed.length === 17) {
                     // C2C
                     user_id = parsed.readUInt32BE(0)
                     time = parsed.readUInt32BE(12)
@@ -527,7 +537,7 @@ const processMessage = async (
                         message.files.push(message.file)
                     } catch (e) {
                         errorHandler(e, true)
-                        message.content = '[语音转换失败]' + (e as Error).message + '\n' + recordUrl
+                        message.content = '[语音转换失败]' + getErrorMessage(e) + '\n' + recordUrl
                     }
                 }
                 break

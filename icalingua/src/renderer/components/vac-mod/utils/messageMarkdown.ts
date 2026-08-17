@@ -1,3 +1,5 @@
+import katex from 'katex'
+
 export interface MessageMarkdownOptions {
     hideImages?: boolean
 }
@@ -19,9 +21,18 @@ interface ListMatch {
     ordered: boolean
 }
 
+interface LatexGroup {
+    content: string
+    end: number
+}
+
+interface LatexMath {
+    end: number
+    expression: string
+}
+
 const LINK_PROTOCOLS = new Set(['http:', 'https:', 'mqqapi:', 'qqapi:', 'icalingua:'])
 const IMAGE_PROTOCOLS = new Set(['http:', 'https:'])
-
 export function renderMessageMarkdown(source: string, options: MessageMarkdownOptions = {}): string {
     const normalized = String(source || '')
         .replace(/\r\n?/g, '\n')
@@ -61,6 +72,13 @@ function renderBlocks(lines: string[], options: MessageMarkdownOptions): string 
         if (!trimmed) {
             result.push('<div class="vac-markdown-spacer" aria-hidden="true"></div>')
             index++
+            continue
+        }
+
+        const displayMath = readDisplayMathBlock(lines, index)
+        if (displayMath) {
+            result.push(renderLatexMath(displayMath.expression, true))
+            index = displayMath.next
             continue
         }
 
@@ -180,6 +198,26 @@ function renderInline(source: string, options: MessageMarkdownOptions): string {
     let index = 0
 
     while (index < source.length) {
+        const math =
+            source[index] === '$'
+                ? readInlineLatexMath(source, index)
+                : source.startsWith('\\(', index)
+                  ? readParenthesizedLatexMath(source, index)
+                  : null
+        if (math) {
+            result.push(renderLatexMath(math.expression, false))
+            index = math.end
+            continue
+        }
+
+        // Prefer the two-character delimiter as one token. An unmatched `$$` must not
+        // fall through and let its second `$` start a separate inline-math token.
+        if (source.startsWith('$$', index)) {
+            result.push('$$')
+            index += 2
+            continue
+        }
+
         if (source[index] === '\\' && index + 1 < source.length) {
             result.push(escapeHtml(source[index + 1]))
             index += 2
@@ -253,6 +291,155 @@ function matchFormatting(
     }
 
     return null
+}
+
+function renderLatexMath(expression: string, display: boolean): string {
+    const className = display ? 'vac-markdown-math vac-markdown-math-display' : 'vac-markdown-math'
+    const tag = display ? 'div' : 'span'
+    try {
+        const rendered = katex.renderToString(sanitizeLatexColorCommands(expression), {
+            displayMode: display,
+            maxExpand: 1000,
+            maxSize: 20,
+            output: 'htmlAndMathml',
+            strict: 'ignore',
+            throwOnError: false,
+            trust: false,
+        })
+        return `<${tag} class="${className}">${rendered}</${tag}>`
+    } catch {
+        return `<${tag} class="${className} vac-markdown-math-error">${escapeHtml(expression)}</${tag}>`
+    }
+}
+
+function sanitizeLatexColorCommands(source: string): string {
+    let result = ''
+    let index = 0
+
+    while (index < source.length) {
+        const command = source.slice(index).match(/^\\(colorbox|textcolor)\s*/)
+        if (!command) {
+            result += source[index]
+            index++
+            continue
+        }
+
+        const colorGroup = readLatexGroup(source, index + command[0].length)
+        const contentGroup = colorGroup && readLatexGroup(source, colorGroup.end)
+        if (!colorGroup || !contentGroup) {
+            result += source[index]
+            index++
+            continue
+        }
+
+        const content = sanitizeLatexColorCommands(contentGroup.content)
+        const color = colorGroup.content.trim()
+        if (isSafeLatexColor(color)) {
+            result += `\\${command[1]}{${color}}{${content}}`
+        } else {
+            result += content
+        }
+        index = contentGroup.end
+    }
+
+    return result
+}
+
+function readLatexGroup(source: string, start: number): LatexGroup | null {
+    if (source[start] !== '{') return null
+
+    let depth = 0
+    for (let index = start; index < source.length; index++) {
+        if (source[index] === '\\') {
+            index++
+            continue
+        }
+        if (source[index] === '{') {
+            depth++
+            continue
+        }
+        if (source[index] !== '}') continue
+
+        depth--
+        if (depth === 0) {
+            return {
+                content: source.slice(start + 1, index),
+                end: index + 1,
+            }
+        }
+    }
+    return null
+}
+
+function isSafeLatexColor(color: string): boolean {
+    return /^(?:#(?:[0-9a-f]{3}|[0-9a-f]{4}|[0-9a-f]{6}|[0-9a-f]{8})|[a-z]+)$/i.test(color)
+}
+
+function readDisplayMathBlock(lines: string[], start: number): { expression: string; next: number } | null {
+    const firstLine = lines[start].trim()
+    const delimiters = firstLine.startsWith('$$')
+        ? { close: '$$', open: '$$' }
+        : firstLine.startsWith('\\[')
+          ? { close: '\\]', open: '\\[' }
+          : null
+    if (!delimiters) return null
+
+    const firstContent = firstLine.slice(delimiters.open.length)
+    const sameLineEnd = findLatexDelimiter(firstContent, 0, delimiters.close)
+    if (sameLineEnd >= 0 && !firstContent.slice(sameLineEnd + delimiters.close.length).trim()) {
+        return { expression: firstContent.slice(0, sameLineEnd), next: start + 1 }
+    }
+
+    const expressionLines = [firstContent]
+    for (let index = start + 1; index < lines.length; index++) {
+        const end = findLatexDelimiter(lines[index], 0, delimiters.close)
+        if (end >= 0 && !lines[index].slice(end + delimiters.close.length).trim()) {
+            expressionLines.push(lines[index].slice(0, end))
+            return { expression: expressionLines.join('\n'), next: index + 1 }
+        }
+        expressionLines.push(lines[index])
+    }
+    return null
+}
+
+function readInlineLatexMath(source: string, start: number): LatexMath | null {
+    const delimiter = source.startsWith('$$', start) ? '$$' : '$'
+    const contentStart = start + delimiter.length
+    const end = findLatexDelimiter(source, contentStart, delimiter)
+    if (end <= contentStart) return null
+    return {
+        expression: source.slice(contentStart, end),
+        end: end + delimiter.length,
+    }
+}
+
+function readParenthesizedLatexMath(source: string, start: number): LatexMath | null {
+    const contentStart = start + 2
+    const end = findLatexDelimiter(source, contentStart, '\\)')
+    if (end <= contentStart) return null
+    return {
+        expression: source.slice(contentStart, end),
+        end: end + 2,
+    }
+}
+
+function findLatexDelimiter(source: string, start: number, delimiter: string): number {
+    let state: 'content' | 'escaped' = 'content'
+
+    for (let index = start; index <= source.length - delimiter.length; index++) {
+        if (state === 'escaped') {
+            state = 'content'
+            continue
+        }
+
+        if (source.startsWith(delimiter, index)) return index
+
+        if (source[index] === '\\') {
+            state = 'escaped'
+            continue
+        }
+    }
+    return -1
 }
 
 function renderLink(label: string, destination: string, options: MessageMarkdownOptions): string {
@@ -334,6 +521,7 @@ function isBlockStart(line: string): boolean {
     return (
         /^\s{0,3}#{1,2}\s+/.test(line) ||
         /^\s*>/.test(line) ||
+        /^\s*(?:\$\$|\\\[)/.test(line) ||
         !!matchListLine(line) ||
         !!matchCodeFence(line) ||
         isHorizontalRule(line)
