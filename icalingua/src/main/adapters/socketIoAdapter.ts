@@ -30,7 +30,7 @@ import { getConfig } from '../utils/configManager'
 import errorHandler from '../utils/errorHandler'
 import getBuildInfo from '../utils/getBuildInfo'
 import isInlineReplySupported from '../utils/isInlineReplySupported'
-import { createTray, requestTrayIconUpdate, updateTrayIcon } from '../utils/trayManager'
+import { createTray, updateTrayIcon } from '../utils/trayManager'
 import ui from '../utils/ui'
 import { checkUpdate, getCachedUpdate } from '../utils/updateChecker'
 import {
@@ -193,7 +193,7 @@ const attachSocketEvents = () => {
         sendDatabaseUpgradeProgress(progress, 'bridge')
         if (!progress.active) void updateAppMenu()
     })
-    socket.on('updateRoom', (room: Room) => {
+    socket.on('updateRoom', async (room: Room) => {
         if (room.roomId === ui.getSelectedRoomId() && getMainWindow().isFocused() && getMainWindow().isVisible()) {
             //把它点掉
             room.unreadCount = 0
@@ -211,7 +211,7 @@ const attachSocketEvents = () => {
             errorHandler(e, true)
         }
         queueLocalStorageWrite((storage) => upsertLocalRoom(storage, room))
-        requestTrayIconUpdate()
+        await updateTrayIcon()
         updateNoctaliaRoom(room)
     })
     socket.on('addMessage', ({ roomId, message }: { roomId: number; message: Message }) => {
@@ -636,6 +636,21 @@ const adapter: Adapter = {
         }
         return localStorage?.validateMessageSearchIndex?.() || Promise.resolve()
     },
+    migrateLegacyAtMessages: () => {
+        if (loggedIn && remoteMessageSearchIndexReady) {
+            remoteMessageSearchIndexReady = false
+            return new Promise<void>((resolve, reject) => {
+                socket.emit('migrateLegacyAtMessages', (result?: { ok?: boolean; error?: string }) => {
+                    if (result?.ok === false) {
+                        reject(new Error(result.error || '旧版 @ 消息迁移失败'))
+                        return
+                    }
+                    resolve()
+                })
+            })
+        }
+        return localStorage?.migrateLegacyAtMessages?.() || Promise.resolve()
+    },
     getMsgNewURL(id: string): Promise<string> {
         return new Promise((resolve) => socket.emit('getMsgNewURL', id, resolve))
     },
@@ -810,6 +825,22 @@ const adapter: Adapter = {
             socket = io(getConfig().server, {
                 transports: ['websocket'],
             })
+            let versionPromptActive = false
+            let authFailedDuringVersionPrompt = false
+            let retryAuthAfterVersionPrompt = false
+            let acceptedProtocolVersion: string | undefined
+            let currentAuthChallenge = ''
+            let authStopped = false
+
+            const reconnectForAuth = () => {
+                if (authStopped) return
+                authFailedDuringVersionPrompt = false
+                retryAuthAfterVersionPrompt = false
+                currentAuthChallenge = ''
+                if (socket.connected) socket.disconnect()
+                socket.connect()
+            }
+
             socket.once('connect_error', async (e) => {
                 errorHandler(e, true)
                 await dialog.showMessageBox(getMainWindow(), {
@@ -820,30 +851,67 @@ const adapter: Adapter = {
                 app.quit()
             })
             socket.on('requireAuth', async (salt: string, version: BridgeVersionInfo) => {
+                currentAuthChallenge = salt
                 versionInfo = version
-                if (version.protocolVersion !== EXCEPTED_PROTOCOL_VERSION && !getConfig().disableBridgeVersionCheck) {
+
+                if (
+                    version.protocolVersion !== EXCEPTED_PROTOCOL_VERSION &&
+                    !getConfig().disableBridgeVersionCheck &&
+                    acceptedProtocolVersion !== version.protocolVersion
+                ) {
+                    versionPromptActive = true
                     const action = await dialog.showMessageBox(getMainWindow(), {
                         title: '提示',
                         message: `当前版本的 Icalingua++ 要求 Bridge 的协议版本为 ${EXCEPTED_PROTOCOL_VERSION}，而服务器的协议版本为 ${version.protocolVersion}`,
                         buttons: ['继续', '退出'],
                         defaultId: 1,
                     })
+                    versionPromptActive = false
                     if (action.response === 1) {
+                        authStopped = true
+                        currentAuthChallenge = ''
+                        socket.disconnect()
                         app.quit()
                         return
                     }
+                    acceptedProtocolVersion = version.protocolVersion
+                    retryAuthAfterVersionPrompt = true
                 }
-                socket.emit('auth', await sign(salt, getConfig().privateKey))
+
+                if (authStopped || authFailedDuringVersionPrompt || !socket.connected) {
+                    if (authFailedDuringVersionPrompt || !socket.connected) reconnectForAuth()
+                    return
+                }
+
+                const signature = await sign(salt, getConfig().privateKey)
+                if (authStopped || currentAuthChallenge !== salt || !socket.connected) {
+                    if (!authStopped && currentAuthChallenge !== salt) return
+                    if (!authStopped) reconnectForAuth()
+                    return
+                }
+                socket.emit('auth', signature)
                 console.log('已向服务端提交身份验证')
             })
-            socket.once('authSucceed', attachSocketEvents)
-            socket.once('authFailed', async () => {
+            socket.once('authSucceed', () => {
+                retryAuthAfterVersionPrompt = false
+                authFailedDuringVersionPrompt = false
+                attachSocketEvents()
+            })
+            socket.on('authFailed', async () => {
+                if (versionPromptActive || retryAuthAfterVersionPrompt) {
+                    authFailedDuringVersionPrompt = true
+                    if (!versionPromptActive) reconnectForAuth()
+                    return
+                }
                 await dialog.showMessageBox(getMainWindow(), {
                     title: '错误',
                     message: '认证失败',
                     type: 'error',
                 })
                 app.quit()
+            })
+            socket.on('disconnect', () => {
+                if (versionPromptActive) authFailedDuringVersionPrompt = true
             })
         }
     },
