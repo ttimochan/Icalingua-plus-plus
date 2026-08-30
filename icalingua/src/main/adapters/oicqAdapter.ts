@@ -67,6 +67,7 @@ import getImageUrlByMd5 from '../../utils/getImageUrlByMd5'
 import getStaticPath from '../../utils/getStaticPath'
 import { newIcalinguaWindow } from '../../utils/IcalinguaWindow'
 import sleep from '../../utils/sleep'
+import { decodeIcalinguaAtName, findIcalinguaAtMarkup } from '../../utils/icalinguaAt'
 import { getUin } from '../ipc/botAndStorage'
 import { download } from '../ipc/downloadManager'
 import { updateAppMenu } from '../ipc/menuManager'
@@ -82,7 +83,7 @@ import {
     splitContentByMediaOrder,
 } from '../utils/messageMediaOrder'
 import processMessage, { registerSilkDecodeCompleter } from '../utils/processMessage'
-import { createTray, updateTrayIcon } from '../utils/trayManager'
+import { createTray, requestTrayIconUpdate, updateTrayIcon } from '../utils/trayManager'
 import ui from '../utils/ui'
 import { checkUpdate, getCachedUpdate } from '../utils/updateChecker'
 import {
@@ -366,7 +367,7 @@ const eventHandlers = {
         ui.updateRoom(room)
         storage.addMessage(roomId, message)
         await storage.updateRoom(roomId, room)
-        updateTrayIcon()
+        requestTrayIconUpdate()
         if (getConfig().custom && data.post_type === 'message') {
             const custom_path = path.join(app.getPath('userData'), 'custom')
             const requireFunc = eval('require')
@@ -1663,24 +1664,17 @@ const adapter: OicqAdapter = {
                 )
         }
         if (content) {
-            // 转换新 @
-            const icalinguaAtRegex = /<IcalinguaAt qq=(\d+)>([^<]*)<\/IcalinguaAt>/
-            while (icalinguaAtRegex.test(content)) {
-                const icalinguaAt = icalinguaAtRegex.exec(content)
-                try {
-                    const atQQ = Number(icalinguaAt[1])
-                    const name = decodeURIComponent(icalinguaAt[2])
-                    if (!name) break
-                    at.push({
-                        id: atQQ === 1 ? 'all' : atQQ,
-                        text: name,
-                    })
-                    shiftMediaOrdersAfterTextReplacement(media, icalinguaAt.index, icalinguaAt[0].length, name.length)
-                    content = content.replace(icalinguaAt[0], name)
-                } catch (e) {
-                    console.error(e)
-                    break
-                }
+            // 转换 @ 标记
+            let icalinguaAt = findIcalinguaAtMarkup(content)
+            while (icalinguaAt) {
+                const name = decodeIcalinguaAtName(icalinguaAt.encodedName)
+                at.push({
+                    id: icalinguaAt.qq === 1 ? 'all' : icalinguaAt.qq,
+                    text: name,
+                })
+                shiftMediaOrdersAfterTextReplacement(media, icalinguaAt.index, icalinguaAt.raw.length, name.length)
+                content = content.replace(icalinguaAt.raw, name)
+                icalinguaAt = findIcalinguaAtMarkup(content)
             }
             //这里是处理@人和表情 markup 的逻辑
             const FACE_REGEX = /\[Face: (\d+)]/

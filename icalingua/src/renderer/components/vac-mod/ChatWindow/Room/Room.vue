@@ -104,11 +104,14 @@
                         <div
                             v-for="(m, i) in messages.slice(visibleViewport.head, visibleViewport.tail)"
                             :key="m._id"
+                            class="vac-message-item"
+                            :data-message-index="i + visibleViewport.head"
                             @dblclick="replyMessage(m, $event)"
                         >
                             <message
                                 :current-user-id="currentUserId"
                                 :message="m"
+                                :date-refresh-key="dateRefreshKey"
                                 :show-date="
                                     i + visibleViewport.head > 0 &&
                                     m.date !== messages[i + visibleViewport.head - 1].date
@@ -589,6 +592,7 @@ import { isImageFile, isVideoFile, isAudioFile } from '../../utils/mediaFile'
 import { getOrderedMessageParts } from '../../utils/messageMediaOrder'
 import Recorder from '../../utils/recorder'
 import groupMemberCache from '@/utils/groupMemberCache'
+import { decodeIcalinguaAtName, findIcalinguaAtMarkup } from '../../../../../utils/icalinguaAt'
 
 const faceDir = path.join(getStaticPath(), 'face')
 const messageDraftStorageKey = 'icalingua:message-draft'
@@ -599,6 +603,10 @@ let keyToSendMessage
 
 // scroll
 const scrollOffset = 300
+
+function getCurrentDateKey(date = new Date()) {
+    return new Date(date.getFullYear(), date.getMonth(), date.getDate()).getTime()
+}
 
 export default {
     name: 'Room',
@@ -666,6 +674,7 @@ export default {
             loadingHeadMessages: false,
             loadingTailMessages: false,
             files: [],
+            attachedObjectUrls: new Set(),
             imageFiles: [],
             videoFiles: [],
             mediaDimensions: null,
@@ -729,6 +738,8 @@ export default {
             audioRecordingStartedAt: 0,
             messageDraftSaveTimer: null,
             pendingMessageDraft: '',
+            dateRefreshKey: getCurrentDateKey(),
+            dateRefreshTimer: null,
             messageListSnapshot: {
                 length: Array.isArray(this.messages) ? this.messages.length : 0,
                 firstId: Array.isArray(this.messages) && this.messages.length ? this.messages[0]._id : null,
@@ -821,6 +832,13 @@ export default {
         loadingMessages(val) {
             if (val) this.infiniteState.head = null
             else if (!val) this.focusTextarea(true)
+        },
+        visibleViewport: {
+            deep: true,
+            handler() {
+                if (!this.mouseSelecting) return
+                this.mouseSelectBounds = null
+            },
         },
         async room(newVal, oldVal) {
             if (newVal.roomId && newVal.roomId !== oldVal.roomId) {
@@ -1018,11 +1036,13 @@ export default {
     },
     async created() {
         this.lifecycleScope = createRendererLifecycleScope()
-        this.optimizeMethod = await ipc.getOptimizeMethodSetting()
-        if (this.$route.name === 'history-page' || this.$route.name === 'member-history-page')
-            this.optimizeMethod = 'none'
+        this.scheduleDateRefresh()
+        const routeOptimizeMethod = this.$route.name === 'history-page' ? 'none' : null
+        this.optimizeMethod = routeOptimizeMethod || (await ipc.getOptimizeMethodSetting())
         keyToSendMessage = await ipc.getKeyToSendMessage()
-        this.lifecycleScope.onIpc('setOptimizeMethodSetting', (_, method) => (this.optimizeMethod = method))
+        this.lifecycleScope.onIpc('setOptimizeMethodSetting', (_, method) => {
+            if (!routeOptimizeMethod) this.optimizeMethod = method
+        })
         this.lifecycleScope.onIpc('startForward', (_, _id) => {
             if (this.showForwardPanel) return
             const message = this.findMessageById(_id)
@@ -1099,9 +1119,22 @@ export default {
             this.mouseSelecting = false
         }
         this.mouseSelectBounds = null
+        this.releaseAttachedObjectUrls()
         this.clearAudioSessions()
     },
     methods: {
+        scheduleDateRefresh() {
+            const now = new Date()
+            const nextDay = new Date(now)
+            nextDay.setHours(24, 0, 0, 100)
+            const delay = Math.max(nextDay.getTime() - now.getTime(), 1000)
+
+            this.dateRefreshTimer = this.lifecycleScope.timeout(() => {
+                this.dateRefreshTimer = null
+                this.dateRefreshKey = getCurrentDateKey()
+                this.scheduleDateRefresh()
+            }, delay)
+        },
         createAudioRecorder() {
             if (this.audioRecorder) return this.audioRecorder
 
@@ -1474,13 +1507,88 @@ export default {
             })
             this.editAndResend = lastMessage._id
         },
+        createAudioSession(messageId) {
+            const session = {
+                audio: new Audio(),
+                mountedCount: 0,
+                releaseTimer: null,
+                eventHandlers: null,
+                disposed: false,
+                onMount: null,
+                onUnmount: null,
+            }
+
+            const scheduleRelease = () => this.scheduleAudioSessionRelease(messageId, session)
+            session.eventHandlers = {
+                play: () => this.cancelAudioSessionRelease(session),
+                pause: scheduleRelease,
+                ended: scheduleRelease,
+                error: scheduleRelease,
+            }
+            Object.entries(session.eventHandlers).forEach(([eventName, handler]) => {
+                session.audio.addEventListener(eventName, handler)
+            })
+
+            session.onMount = () => {
+                if (session.disposed) return
+                session.mountedCount++
+                this.cancelAudioSessionRelease(session)
+            }
+            session.onUnmount = () => {
+                if (session.disposed) return
+                session.mountedCount = Math.max(0, session.mountedCount - 1)
+                if (!session.mountedCount) this.scheduleAudioSessionRelease(messageId, session)
+            }
+
+            return session
+        },
+        isAudioSessionPlaying(session) {
+            const audio = session?.audio
+            return !!audio && !audio.paused && !audio.ended && !audio.error
+        },
+        cancelAudioSessionRelease(session) {
+            if (!session || session.releaseTimer === null || session.releaseTimer === undefined) return
+            this.lifecycleScope?.cancelTimeout(session.releaseTimer)
+            session.releaseTimer = null
+        },
+        scheduleAudioSessionRelease(messageId, session) {
+            if (session.disposed || session.mountedCount || session.releaseTimer !== null) return
+
+            const release = () => {
+                session.releaseTimer = null
+                if (session.disposed || session.mountedCount || this.isAudioSessionPlaying(session)) return
+                this.releaseAudioSession(messageId, session)
+            }
+            const timer = this.lifecycleScope?.timeout(release, 0)
+            if (timer !== null && timer !== undefined) session.releaseTimer = timer
+            else release()
+        },
+        disposeAudioSession(session) {
+            if (!session || session.disposed) return
+            session.disposed = true
+            this.cancelAudioSessionRelease(session)
+            if (session.eventHandlers) {
+                Object.entries(session.eventHandlers).forEach(([eventName, handler]) => {
+                    session.audio.removeEventListener(eventName, handler)
+                })
+                session.eventHandlers = null
+            }
+            this.resetAudioSession(session)
+            session.onMount = null
+            session.onUnmount = null
+            session.mountedCount = 0
+        },
+        releaseAudioSession(messageId, session) {
+            if (this.audioSessions[messageId] !== session) return
+            if (session.mountedCount || this.isAudioSessionPlaying(session)) return
+            this.disposeAudioSession(session)
+            this.$delete(this.audioSessions, messageId)
+        },
         getAudioSession(message) {
             if (!message || !message._id || !message.file || !isAudioFile(message.file)) return null
             if (message.file.name === 'decoding' || message.file.url === 'decoding') return null
             if (!this.audioSessions[message._id]) {
-                this.$set(this.audioSessions, message._id, {
-                    audio: new Audio(),
-                })
+                this.$set(this.audioSessions, message._id, this.createAudioSession(message._id))
             }
             return this.audioSessions[message._id]
         },
@@ -1492,7 +1600,7 @@ export default {
             audio.load()
         },
         clearAudioSessions() {
-            Object.values(this.audioSessions).forEach((session) => this.resetAudioSession(session))
+            Object.values(this.audioSessions).forEach((session) => this.disposeAudioSession(session))
             this.audioSessions = {}
         },
         sendForward(target, name, multi = true, anonymous = false) {
@@ -1559,10 +1667,11 @@ export default {
                             }
 
                             let partContent = messagePart.content
-                            const icalinguaAtRegex = /<IcalinguaAt qq=\d+>([^<]*)<\/IcalinguaAt>/
-                            while (icalinguaAtRegex.test(partContent)) {
-                                const icalinguaAt = icalinguaAtRegex.exec(partContent)
-                                partContent = partContent.replace(icalinguaAt[0], decodeURIComponent(icalinguaAt[1]))
+                            let icalinguaAt = findIcalinguaAtMarkup(partContent)
+                            while (icalinguaAt) {
+                                const name = decodeIcalinguaAtName(icalinguaAt.encodedName)
+                                partContent = partContent.replace(icalinguaAt.raw, name)
+                                icalinguaAt = findIcalinguaAtMarkup(partContent)
                             }
 
                             const FACE_REGEX = /\[Face: (\d+)]/
@@ -1883,6 +1992,7 @@ export default {
         },
         resetMessage(disableMobileFocus = null, editFile = null) {
             this.$emit('typing-message', null)
+            this.releaseAttachedObjectUrls()
 
             if (editFile) {
                 this.files = []
@@ -1914,7 +2024,8 @@ export default {
             if (!type) return
 
             const blob = await read[0].getType(type)
-            const url = URL.createObjectURL(blob)
+            if (this._isBeingDestroyed || this._isDestroyed) return
+            const url = this.registerAttachedObjectUrl(URL.createObjectURL(blob))
             this.imageFiles.push(url)
             this.files.push({
                 name: '粘贴的图片',
@@ -1924,7 +2035,20 @@ export default {
             })
             this.focusTextarea()
         },
+        registerAttachedObjectUrl(url) {
+            if (typeof url === 'string' && url.startsWith('blob:')) this.attachedObjectUrls.add(url)
+            return url
+        },
+        releaseAttachedObjectUrl(url) {
+            if (!this.attachedObjectUrls.has(url)) return
+            URL.revokeObjectURL(url)
+            this.attachedObjectUrls.delete(url)
+        },
+        releaseAttachedObjectUrls(urls = this.attachedObjectUrls) {
+            for (const url of urls) this.releaseAttachedObjectUrl(url)
+        },
         resetMediaFile() {
+            this.releaseAttachedObjectUrls()
             this.mediaDimensions = null
             this.imageFiles = []
             this.videoFiles = []
@@ -1934,6 +2058,10 @@ export default {
             this.scheduleTextareaResize()
         },
         removeImage(idx) {
+            const file = this.files[idx]
+            this.releaseAttachedObjectUrl(this.imageFiles[idx])
+            this.releaseAttachedObjectUrl(file?.localUrl)
+            this.releaseAttachedObjectUrl(file?.url)
             this.imageFiles.splice(idx, 1)
             this.files.splice(idx, 1)
             if (!this.imageFiles.length && !this.files.length) {
@@ -2278,24 +2406,28 @@ export default {
                 const isImage = isImageFile(fileObj)
                 const isVideo = isVideoFile(fileObj)
                 const isAudio = isAudioFile(fileObj)
-                const fileURL = filePath || (isImage || isVideo || isAudio ? URL.createObjectURL(file) : '')
+                const generatedObjectUrl = !filePath && (isImage || isVideo || isAudio)
+                const fileURL = filePath || (generatedObjectUrl ? URL.createObjectURL(file) : '')
                 fileObj.localUrl = fileURL
 
                 // File 本身就是惰性 Blob。仅图片和音频在发送阶段需要读取内容；
                 // 普通文件与视频走路径上传，避免添加附件时把大文件完整读入渲染进程。
                 if (isImage || isAudio) fileObj.blob = file
-                this.files.push(fileObj)
 
                 if (isImage) {
+                    if (generatedObjectUrl) this.registerAttachedObjectUrl(fileURL)
+                    this.files.push(fileObj)
                     this.imageFiles.push(fileURL)
                 } else if (isVideo) {
                     this.resetMediaFile()
+                    if (generatedObjectUrl) this.registerAttachedObjectUrl(fileURL)
                     this.files = [fileObj]
                     this.videoFiles.push(fileURL)
                     this.lifecycleScope.timeout(() => this.onMediaLoad(), 50)
                     break
                 } else if (isAudio) {
                     this.resetMediaFile()
+                    if (generatedObjectUrl) this.registerAttachedObjectUrl(fileURL)
                     this.files = [fileObj]
                     this.videoFiles.push(fileURL)
                     this.lifecycleScope.timeout(() => this.onMediaLoad(), 50)
@@ -2317,7 +2449,8 @@ export default {
             this.fileDialog = true
 
             const blobFile = await fetch(GifURL).then((res) => res.blob())
-            const fileURL = URL.createObjectURL(blobFile)
+            if (this._isBeingDestroyed || this._isDestroyed) return
+            const fileURL = this.registerAttachedObjectUrl(URL.createObjectURL(blobFile))
             const typeIndex = GifURL.lastIndexOf('.')
 
             const fileObj = {
@@ -2531,10 +2664,14 @@ export default {
             this.mouseSelectBounds = [...container.querySelectorAll('.vac-message-box')]
                 .map((msgBox) => {
                     const msgCard = msgBox.querySelector('.vac-message-card')
-                    if (!msgCard) return null
+                    const messageItem = msgBox.closest('.vac-message-item')
+                    const messageIndex = messageItem ? Number(messageItem.dataset.messageIndex) : -1
+                    const message = Number.isInteger(messageIndex) ? this.messages[messageIndex] : null
+                    if (!msgCard || !message) return null
                     const { x, y, width, height } = msgCard.getBoundingClientRect()
                     return {
                         id: msgBox.id,
+                        message,
                         x1: x,
                         y1: y,
                         x2: x + width,
@@ -2558,9 +2695,10 @@ export default {
             el.style.height = ay2 - ay1 + 'px'
 
             if (this.mouseSelectBounds === null) this.refreshMouseSelectBounds()
-            const selectedIds = (this.mouseSelectBounds || [])
-                .filter((bound) => !(ax2 < bound.x1 || bound.x2 < ax1 || ay2 < bound.y1 || bound.y2 < ay1))
-                .map((bound) => bound.id)
+            const selectedBounds = (this.mouseSelectBounds || []).filter(
+                (bound) => !(ax2 < bound.x1 || bound.x2 < ax1 || ay2 < bound.y1 || bound.y2 < ay1),
+            )
+            const selectedIds = selectedBounds.map((bound) => bound.id)
             const currentIds = this.mouseSelectIds || []
             const selectionUnchanged =
                 selectedIds.length === currentIds.length && selectedIds.every((id, index) => id === currentIds[index])
@@ -2577,11 +2715,11 @@ export default {
                     nextForwardMessages.push(message)
                 }
             }
-            const messagesById = new Map(this.messages.map((message) => [messageIdKey(message._id), message]))
-            for (const id of selectedIds) {
-                const key = messageIdKey(id)
-                const message = messagesById.get(key)
-                if (message && !nextForwardIds.has(key)) {
+            for (const bound of selectedBounds) {
+                const message = bound.message
+                if (!message) continue
+                const key = messageIdKey(bound.id)
+                if (!nextForwardIds.has(key)) {
                     nextForwardIds.add(key)
                     nextForwardMessages.push(message)
                 }

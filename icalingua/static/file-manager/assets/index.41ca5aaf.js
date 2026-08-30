@@ -397,6 +397,14 @@ function Y(t) {
 function J(t, e = new Date()) {
     return Y.call(e, t);
 }
+function sanitizeDownloadDirectoryName(t) {
+    const e = String(t || "")
+        .replace(/[^\u4e00-\u9fa5a-zA-Z0-9._()\- ]/g, "_")
+        .replace(/\.+/g, ".")
+        .replace(/^[.\s]+/, "")
+        .slice(0, 50);
+    return e || "_";
+}
 var Q = ({ socket: t }) => {
     const [e, r] = c.exports.useState(!0),
         [n, o] = c.exports.useState("/"),
@@ -407,6 +415,15 @@ var Q = ({ socket: t }) => {
         [selectedCount, setSelectedCount] = c.exports.useState(0),
         selectedRowKeysRef = c.exports.useRef([]),
         [selectionResetKey, setSelectionResetKey] = c.exports.useState(0),
+        [batchDownloadProgress, setBatchDownloadProgress] = c.exports.useState(null),
+        batchDownloadLockRef = c.exports.useRef(false),
+        [uploadProgress, setUploadProgress] = c.exports.useState(null),
+        [isDragging, setIsDragging] = c.exports.useState(false),
+        dragCounterRef = c.exports.useRef(0),
+        uploadLockRef = c.exports.useRef(false),
+        uploadQueueRef = c.exports.useRef([]),
+        uploadStatsRef = c.exports.useRef({ total: 0, success: 0, failed: 0 }),
+        [refreshKey, setRefreshKey] = c.exports.useState(0),
         [f, B] = c.exports.useState(0),
         E = c.exports.useMemo(() => [
             {
@@ -461,8 +478,7 @@ var Q = ({ socket: t }) => {
                 onChange: (u) => {
                     selectedRowKeysRef.current = u;
                     setSelectedCount(u.length);
-                },
-                getCheckboxProps: (u) => ({ disabled: "is_dir" in u })
+                }
             }),
             []
         );
@@ -473,9 +489,13 @@ var Q = ({ socket: t }) => {
                 t.ls(n, f).then((u) => {
                     v(u), n === "/" && !f && x(u.filter((a) => a.is_dir)), r(!1);
                 });
-        }, [n, f]),
+        }, [n, f, refreshKey]),
         l("div", {
-            style: { height: "100%", display: "flex", flexDirection: "column", minWidth: 0 },
+            style: { height: "100%", display: "flex", flexDirection: "column", minWidth: 0, position: "relative" },
+            onDragEnter: handleDragEnter,
+            onDragOver: handleDragOver,
+            onDragLeave: handleDragLeave,
+            onDrop: handleDrop,
             children: [
                 l("div", {
                     style: { display: "flex", alignItems: "center", gap: 10, padding: 10, flex: "0 0 auto" },
@@ -491,17 +511,23 @@ var Q = ({ socket: t }) => {
                         }),
                         i("button", {
                             type: "button",
-                            disabled: selectedCount === 0,
+                            disabled: selectedCount === 0 || batchDownloadProgress !== null,
                             onClick: batchDownload,
-                            children: selectedCount ? `批量下载 (${selectedCount})` : "批量下载",
+                            children: batchDownloadProgress
+                                ? batchDownloadProgress.total
+                                    ? `批量下载中 (${batchDownloadProgress.current}/${batchDownloadProgress.total})`
+                                    : "正在准备下载..."
+                                : selectedCount
+                                    ? `批量下载 (${selectedCount})`
+                                    : "批量下载",
                             style: {
                                 height: 32,
                                 padding: "0 12px",
                                 border: "1px solid #1890ff",
                                 borderRadius: 4,
                                 color: "#fff",
-                                backgroundColor: selectedCount ? "#1890ff" : "#d9d9d9",
-                                cursor: selectedCount ? "pointer" : "not-allowed"
+                                backgroundColor: selectedCount && !batchDownloadProgress ? "#1890ff" : "#d9d9d9",
+                                cursor: selectedCount && !batchDownloadProgress ? "pointer" : "not-allowed"
                             }
                         }),
                         i("input", {
@@ -519,6 +545,11 @@ var Q = ({ socket: t }) => {
                                 borderRadius: 4,
                                 outline: "none"
                             }
+                        }),
+                        uploadProgress && i("span", {
+                            style: { color: "#1890ff", fontSize: 12, maxWidth: 260, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" },
+                            title: uploadProgress.name,
+                            children: `上传中 ${uploadProgress.current}/${uploadProgress.total}：${uploadProgress.name} (${uploadProgress.percent}%)`
                         })
                     ]
                 }),
@@ -532,6 +563,22 @@ var Q = ({ socket: t }) => {
                     locale: { emptyText: Z ? "未找到匹配的文件" : "暂无文件" },
                     scroll: { y: "calc(100vh - 120px)" },
                     rowSelection
+                }),
+                isDragging && l("div", {
+                    style: {
+                        position: "absolute",
+                        inset: 0,
+                        zIndex: 10,
+                        display: "flex",
+                        alignItems: "center",
+                        justifyContent: "center",
+                        backgroundColor: "rgba(24, 144, 255, 0.12)",
+                        border: "2px dashed #1890ff",
+                        color: "#1890ff",
+                        fontSize: 20,
+                        pointerEvents: "none"
+                    },
+                    children: uploadProgress ? "正在上传，请稍候" : "松开鼠标上传到当前目录"
                 })
             ]
         })
@@ -540,42 +587,173 @@ var Q = ({ socket: t }) => {
         currentDir = a;
         B(0), o(u), d(a), z(""), (selectedRowKeysRef.current = []), setSelectedCount(0), setSelectionResetKey((m) => m + 1);
     }
-    async function batchDownload() {
-        const files = selectedRowKeysRef.current
-            .map((u) => F.find((a) => a.fid === u))
-            .filter((u) => u && !("is_dir" in u));
-        if (!files.length) return;
-
-        let successCount = 0;
-        let failedCount = 0;
-        for (let m = 0; m < files.length; m++) {
-            const u = files[m];
-            try {
-                const result = await t.download(u.fid);
-                if (!result || result.url === "error") {
-                    failedCount++;
-                } else {
-                    window["download"] ? window["download"](result.url, result.name, undefined, false) : console.log("error", result);
-                    successCount++;
-                }
-            } catch (a) {
-                failedCount++;
+    async function collectFolderFiles(folder, directorySegments, tasks, directories) {
+        const directory = directorySegments.join("/");
+        directories.add(directory);
+        const entries = await t.ls(folder.fid, 0);
+        for (const entry of entries || []) {
+            if ("is_dir" in entry) {
+                await collectFolderFiles(
+                    entry,
+                    [...directorySegments, sanitizeDownloadDirectoryName(entry.name)],
+                    tasks,
+                    directories
+                );
+            } else {
+                tasks.push({ file: entry, dir: directory });
             }
-            if (m < files.length - 1) await new Promise((a) => setTimeout(a, 300));
         }
-        selectedRowKeysRef.current = [];
-        setSelectedCount(0), setSelectionResetKey((m) => m + 1);
-        if (successCount) {
-            y.success({
-                message: "已发送下载任务",
-                description: `已发送 ${successCount} 个下载任务`
-            });
+    }
+    async function batchDownload() {
+        if (batchDownloadLockRef.current) return;
+        const selectedItems = selectedRowKeysRef.current
+            .map((u) => F.find((a) => a.fid === u))
+            .filter(Boolean);
+        if (!selectedItems.length) return;
+
+        batchDownloadLockRef.current = true;
+        setBatchDownloadProgress({ current: 0, total: 0 });
+        try {
+            let successCount = 0;
+            let failedCount = 0;
+            const tasks = [];
+            const directories = new Set();
+            for (const item of selectedItems) {
+                if ("is_dir" in item) {
+                    try {
+                        await collectFolderFiles(item, [sanitizeDownloadDirectoryName(item.name)], tasks, directories);
+                    } catch (a) {
+                        failedCount++;
+                    }
+                } else {
+                    tasks.push({ file: item, dir: undefined });
+                }
+            }
+            setBatchDownloadProgress({ current: 0, total: tasks.length });
+            for (const directory of directories) {
+                if (window["createDownloadDirectory"]) window["createDownloadDirectory"](directory);
+            }
+            for (let m = 0; m < tasks.length; m++) {
+                const task = tasks[m];
+                try {
+                    const result = await t.download(task.file.fid);
+                    if (!result || !result.url || result.url === "error") {
+                        failedCount++;
+                    } else {
+                        const outputName = result.name || task.file.name;
+                        if (window["download"]) {
+                            window["download"](result.url, outputName, task.dir, false);
+                            successCount++;
+                        } else {
+                            console.log("error", result);
+                            failedCount++;
+                        }
+                    }
+                } catch (a) {
+                    failedCount++;
+                }
+                setBatchDownloadProgress({ current: m + 1, total: tasks.length });
+                if (m < tasks.length - 1) await new Promise((a) => setTimeout(a, 300));
+            }
+            selectedRowKeysRef.current = [];
+            setSelectedCount(0), setSelectionResetKey((m) => m + 1);
+            if (successCount || directories.size) {
+                y.success({
+                    message: "已发送下载任务",
+                    description: successCount
+                        ? `已发送 ${successCount} 个下载任务${directories.size ? `，已创建 ${directories.size} 个目录` : ""}`
+                        : `已创建 ${directories.size} 个下载目录`
+                });
+            }
+            if (failedCount) {
+                y.error({
+                    message: "部分文件下载失败",
+                    description: `${failedCount} 个下载项未能发送下载任务`
+                });
+            }
+        } finally {
+            batchDownloadLockRef.current = false;
+            setBatchDownloadProgress(null);
         }
-        if (failedCount) {
-            y.error({
-                message: "部分文件下载失败",
-                description: `${failedCount} 个文件未能发送下载任务`
-            });
+    }
+    function handleDragEnter(u) {
+        u.preventDefault();
+        dragCounterRef.current += 1;
+        setIsDragging(true);
+    }
+    function handleDragOver(u) {
+        u.preventDefault();
+        if (u.dataTransfer) u.dataTransfer.dropEffect = "copy";
+        setIsDragging(true);
+    }
+    function handleDragLeave(u) {
+        u.preventDefault();
+        dragCounterRef.current = Math.max(0, dragCounterRef.current - 1);
+        if (!dragCounterRef.current) setIsDragging(false);
+    }
+    function handleDrop(u) {
+        u.preventDefault();
+        dragCounterRef.current = 0;
+        setIsDragging(false);
+        const a = Array.from((u.dataTransfer && u.dataTransfer.files) || []);
+        if (a.length) uploadFiles(a);
+    }
+    async function uploadFiles(u) {
+        uploadQueueRef.current.push(...u);
+        uploadStatsRef.current.total += u.length;
+        const a = uploadStatsRef.current.total;
+        if (uploadLockRef.current) {
+            setUploadProgress((u) => u && { ...u, total: a });
+            return;
+        }
+        uploadLockRef.current = true;
+        const r = n;
+        const stats = uploadStatsRef.current;
+        try {
+            while (uploadQueueRef.current.length) {
+                const v = uploadQueueRef.current.shift();
+                const current = stats.success + stats.failed + 1;
+                let lastPercent = 0;
+                setUploadProgress({ current, total: stats.total, name: v.name || "file", percent: lastPercent });
+                try {
+                    const onProgress = (u) =>
+                        setUploadProgress((a) => {
+                            const progress = Number(u);
+                            if (!Number.isFinite(progress)) return a;
+                            lastPercent = Math.max(lastPercent, Math.min(100, progress));
+                            return a && { ...a, total: stats.total, percent: lastPercent };
+                        });
+                    let filePath = v.path;
+                    const webUtils = window["webUtils"];
+                    if (!filePath && webUtils && webUtils.getPathForFile) {
+                        console.log("Electron >= 32.0.0");
+                        try {
+                            filePath = webUtils.getPathForFile(v);
+                        } catch (u) {
+                            console.error(u);
+                        }
+                    }
+                    if (!window["uploadGroupFile"] || !filePath) throw new Error("当前窗口不支持文件上传");
+                    await window["uploadGroupFile"](t.groupInfo.group_id, filePath, r, v.name || "file", onProgress);
+                    stats.success++;
+                } catch (u) {
+                    stats.failed++;
+                    console.error("file upload error:", u);
+                }
+            }
+            setRefreshKey((u) => u + 1);
+            if (stats.success) {
+                y.success({
+                    message: "上传完成",
+                    description: `已上传 ${stats.success} 个文件${stats.failed ? `，${stats.failed} 个文件失败` : ""}`
+                });
+            }
+            if (stats.failed) y.error({ message: "部分文件上传失败", description: `${stats.failed} 个文件未能上传` });
+        } finally {
+            uploadLockRef.current = false;
+            setUploadProgress(null);
+            uploadQueueRef.current = [];
+            uploadStatsRef.current = { total: 0, success: 0, failed: 0 };
         }
     }
     async function k(u, saveAs = false) {

@@ -7,7 +7,7 @@ import edl from 'electron-dl'
 import path from 'path'
 import { getConfig, saveConfigFile } from '../utils/configManager'
 import ui from '../utils/ui'
-import { getMainWindow } from '../utils/windowManager'
+import { getMainWindow, sendToSettingsWindow } from '../utils/windowManager'
 import { getGroupFileMeta, getPrivateFileUrl } from './botAndStorage'
 import fs from 'fs'
 import crypto from 'crypto'
@@ -80,6 +80,26 @@ export const loadConfig = (config: Aria2Config) => {
 
 const downloads = new Map<string, DownloadItem>()
 
+export const getDefaultDownloadPath = () => getConfig().downloadPath || app.getPath('downloads')
+
+const resolveDownloadDirectory = (dir?: string) => {
+    const defaultDownloadPath = getDefaultDownloadPath()
+    if (!dir || path.isAbsolute(dir)) return dir || defaultDownloadPath
+
+    const resolved = path.resolve(defaultDownloadPath, dir)
+    const relative = path.relative(defaultDownloadPath, resolved)
+    if (relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
+        throw new Error('下载目录不能超出默认下载目录')
+    }
+    return resolved
+}
+
+export const ensureDownloadDirectory = (dir?: string) => {
+    const resolved = resolveDownloadDirectory(dir)
+    fs.mkdirSync(resolved, { recursive: true })
+    return resolved
+}
+
 const formatFileSize = (size: number) => {
     if (size < 1024) return size + 'B'
     else if (size < 1024 * 1024) return (size / 1024).toFixed(2) + 'KB'
@@ -117,18 +137,20 @@ const registerDownload = (item: DownloadItem, url: string, fileName: string) => 
 
 export const download = async (url: string, out: string, dir?: string, saveAs = false) => {
     url = new URL(url).href
+    dir = resolveDownloadDirectory(dir)
     if (saveAs) {
         const result = await dialog.showSaveDialog(BrowserWindow.getFocusedWindow() || getMainWindow(), {
-            defaultPath: dir ? path.join(dir, out) : out,
+            defaultPath: path.join(dir, out),
         })
         if (result.canceled) return
         out = path.basename(result.filePath)
         dir = path.dirname(result.filePath)
     }
+    fs.mkdirSync(dir, { recursive: true })
     const ext = path.extname(out)
     const base = path.basename(out, ext)
     let i = 1
-    while (!saveAs && fs.existsSync(path.join(dir ? dir : app.getPath('downloads'), out))) {
+    while (!saveAs && fs.existsSync(path.join(dir, out))) {
         out = base + ' (' + i + ')' + ext
         i++
     }
@@ -243,8 +265,7 @@ export const downloadImage = async (url: string, saveAs = false, basename = '') 
         basename = 'QQ_Image_' + new Date().getTime()
     }
     const out = basename + '.' + (await getImageExt(url))
-    const dir = app.getPath('downloads')
-    await download(url, out, aria2 ? null : dir, saveAs)
+    await download(url, out, undefined, saveAs)
 }
 
 export const downloadImage2Open = async (url: string) => {
@@ -328,6 +349,14 @@ export const saveTextAs = async (text: string, filename: string) => {
 }
 
 ipcMain.on('download', (_, url, out, dir, saveAs) => download(url, out, dir, saveAs))
+ipcMain.on('createDownloadDirectory', (_, dir: string) => {
+    try {
+        ensureDownloadDirectory(dir)
+    } catch (error) {
+        console.error('创建下载目录失败', error)
+        errorHandler(error, true)
+    }
+})
 ipcMain.on('downloadFileByMessageData', (_, data: { action: string; message: Message; room: Room }) =>
     downloadFileByMessageData(data),
 )
@@ -342,5 +371,6 @@ ipcMain.on('setAria2Config', (_, config: Aria2Config) => {
     getConfig().aria2 = config
     loadConfig(config)
     saveConfigFile()
+    sendToSettingsWindow('settings:aria2-updated', config)
 })
 ipcMain.on('saveTextAs', (_, text, filename) => saveTextAs(text, filename))

@@ -7,11 +7,17 @@ import Message from '@icalingua/types/Message'
 import MessagePageOptions from '@icalingua/types/MessagePage'
 import RoamingStamp from '@icalingua/types/RoamingStamp'
 import Room from '@icalingua/types/Room'
+import GroupMenuContext from '@icalingua/types/GroupMenuContext'
 import SearchableGroup from '@icalingua/types/SearchableGroup'
 import { ipcRenderer } from 'electron'
 import { FakeMessage, FriendInfo, GroupInfo, MemberInfo } from 'oicq-icalingua-plus-plus'
 import SpecialFeature from '@icalingua/types/SpecialFeature'
 import DatabaseUpgradeProgress from '@icalingua/types/DatabaseUpgradeProgress'
+
+type SettingsPatch = Omit<Partial<AllConfig>, 'account'> & {
+    account?: Partial<AllConfig['account']>
+    hideTitleBar?: boolean
+}
 
 const ipc = {
     sendMessage(data) {
@@ -31,6 +37,15 @@ const ipc = {
     },
     async getSettings(): Promise<AllConfig> {
         return await ipcRenderer.invoke('getSettings')
+    },
+    async updateSettings(patch: SettingsPatch): Promise<AllConfig> {
+        return await ipcRenderer.invoke('updateSettings', patch)
+    },
+    async chooseDownloadPath(): Promise<string | null> {
+        return await ipcRenderer.invoke('chooseDownloadPath')
+    },
+    async resetDownloadPath(): Promise<string> {
+        return await ipcRenderer.invoke('resetDownloadPath')
     },
     async getAria2Settings(): Promise<Aria2Config> {
         return (await this.getSettings()).aria2
@@ -104,6 +119,24 @@ const ipc = {
     openGlobalMessageSearch() {
         ipcRenderer.send('openGlobalMessageSearch')
     },
+    openSettings() {
+        ipcRenderer.send('openSettings')
+    },
+    openIgnoreManage() {
+        ipcRenderer.send('openIgnoreManage')
+    },
+    openAria2Settings() {
+        ipcRenderer.send('openAria2Settings')
+    },
+    openSetLockPassword() {
+        ipcRenderer.send('openSetLockPassword')
+    },
+    openMakeForwardDebug() {
+        ipcRenderer.send('openMakeForwardDebug')
+    },
+    openNotificationHelp() {
+        ipcRenderer.send('openNotificationHelp')
+    },
     openMemberHistory(senderId: number, roomId: number, senderName: string) {
         ipcRenderer.send('openMemberHistory', senderId, roomId, senderName)
     },
@@ -134,6 +167,9 @@ const ipc = {
     },
     async getVersion(): Promise<string> {
         return await ipcRenderer.invoke('getVersion')
+    },
+    async getBuildInfo(): Promise<{ version: string; isProduction: boolean }> {
+        return await ipcRenderer.invoke('getBuildInfo')
     },
     async getDbUpgradeProgress(): Promise<DatabaseUpgradeProgress> {
         return await ipcRenderer.invoke('getDbUpgradeProgress')
@@ -192,11 +228,11 @@ const ipc = {
     popupStickerDirMenu(dirName: string, e) {
         ipcRenderer.send('popupStickerDirMenu', dirName, { x: e.screenX, y: e.screenY })
     },
-    popupContactMenu(e, remark?: string, name?: string, displayId?: number, group?: SearchableGroup) {
-        ipcRenderer.send('popupContactMenu', { x: e.screenX, y: e.screenY }, remark, name, displayId, group)
+    popupContactMenu(e, remark?: string, name?: string, displayId?: number, groupContext?: GroupMenuContext) {
+        ipcRenderer.send('popupContactMenu', { x: e.screenX, y: e.screenY }, remark, name, displayId, groupContext)
     },
-    popupGroupMemberMenu(e, remark?: string, name?: string, displayId?: number, group?: SearchableGroup) {
-        ipcRenderer.send('popupGroupMemberMenu', { x: e.screenX, y: e.screenY }, remark, name, displayId, group)
+    popupGroupMemberMenu(e, remark?: string, name?: string, displayId?: number, groupContext?: GroupMenuContext) {
+        ipcRenderer.send('popupGroupMemberMenu', { x: e.screenX, y: e.screenY }, remark, name, displayId, groupContext)
     },
     popupMessageMenu(e, room: Room, message: Message, sect?: string, history?: boolean) {
         ipcRenderer.send('popupMessageMenu', { x: e.screenX, y: e.screenY }, room, message, sect, history)

@@ -22,6 +22,7 @@ import {
     isAppLocked,
     lockMainWindow,
     setMainWindowTitleBarHidden,
+    showSettingsWindow,
     tryToShowMainWindow,
 } from './windowManager'
 import openImage from '../ipc/openImage'
@@ -36,6 +37,11 @@ let darknewmsgIcon = nativeImage.createFromPath(path.join(getStaticPath(), 'dark
 let newmsgIcon = nativeImage.createFromPath(path.join(getStaticPath(), 'newmsg.png'))
 let darkIcon = nativeImage.createFromPath(path.join(getStaticPath(), 'dark.png'))
 let lightIcon = nativeImage.createFromPath(path.join(getStaticPath(), '256x256.png'))
+
+const TRAY_ICON_UPDATE_DELAY = 100
+let trayIconUpdateTimer: ReturnType<typeof setTimeout> | null = null
+let trayIconUpdateRunning = false
+let trayIconUpdatePending = false
 
 export const createTray = () => {
     if (getConfig().hideTray) return
@@ -130,6 +136,12 @@ const _updateTrayMenu = async () => {
         )
         menu.append(new MenuItem({ type: 'separator' }))
     }
+    menu.append(
+        new MenuItem({
+            label: '设置',
+            click: showSettingsWindow,
+        }),
+    )
     menu.append(
         new MenuItem({
             label: '通知设置',
@@ -346,4 +358,28 @@ export const updateTrayIcon = async (force = false) => {
         }
         updateTrayMenu()
     }
+}
+
+/** 合并消息突发期间的托盘刷新，避免每条消息都重复查询数据库和更新原生托盘。 */
+export const requestTrayIconUpdate = () => {
+    if (!tray) return
+    trayIconUpdatePending = true
+    if (trayIconUpdateRunning || trayIconUpdateTimer) return
+
+    trayIconUpdateTimer = setTimeout(() => {
+        trayIconUpdateTimer = null
+        trayIconUpdatePending = false
+        trayIconUpdateRunning = true
+
+        void (async () => {
+            try {
+                await updateTrayIcon()
+            } catch (error) {
+                console.error('更新托盘图标失败:', error)
+            } finally {
+                trayIconUpdateRunning = false
+                if (trayIconUpdatePending && !trayIconUpdateTimer) requestTrayIconUpdate()
+            }
+        })()
+    }, TRAY_ICON_UPDATE_DELAY)
 }

@@ -46,7 +46,10 @@
 import Room from '../components/vac-mod/ChatWindow/Room/Room'
 import ipc from '../utils/ipc'
 import { createRendererLifecycleScope } from '../utils/rendererLifecycleScope'
+import { messageIdKey } from '../utils/messageOrder'
 import '../utils/themes'
+
+const MEMBER_HISTORY_PAGE_SIZE = 20
 
 export default {
     name: 'MemberHistoryView',
@@ -72,21 +75,66 @@ export default {
             loading: false,
             account: 0,
             username: '',
+            historyRequestId: 0,
+            memberHistorySetupReady: false,
+            pendingMemberHistory: null,
         }
     },
     async created() {
         this.lifecycleScope = createRendererLifecycleScope()
         document.title = '查看发言记录'
-        const settings = await ipc.getSettings()
-        this.linkify = settings.linkify
-        this.usePanguJsRecv = settings.usePanguJsRecv
-        this.account = await ipc.getUin()
-        this.username = await ipc.getNick()
-        this.lifecycleScope.onIpc('initMemberHistory', async (event, { senderId, roomId, senderName }) => {
+        // 主进程在 did-finish-load 后只发送一次初始化事件，必须先注册监听器，避免被前面的 await 丢弃。
+        this.lifecycleScope.onIpc('initMemberHistory', (event, payload) => {
+            if (!this.memberHistorySetupReady) {
+                this.pendingMemberHistory = payload
+                return
+            }
+            this.startMemberHistoryInitialization(payload)
+        })
+        try {
+            const settings = await ipc.getSettings()
+            this.linkify = settings.linkify
+            this.usePanguJsRecv = settings.usePanguJsRecv
+            this.account = await ipc.getUin()
+            this.username = await ipc.getNick()
+        } catch (e) {
+            console.error('Failed to initialize member history view:', e)
+        } finally {
+            this.memberHistorySetupReady = true
+            if (this.pendingMemberHistory !== null && !this._isBeingDestroyed && !this._isDestroyed) {
+                const payload = this.pendingMemberHistory
+                this.pendingMemberHistory = null
+                this.startMemberHistoryInitialization(payload)
+            }
+        }
+    },
+    beforeDestroy() {
+        this.historyRequestId++
+        this.lifecycleScope?.dispose()
+    },
+    components: {
+        Room,
+    },
+    methods: {
+        startMemberHistoryInitialization(payload) {
+            if (this._isBeingDestroyed || this._isDestroyed) return
+            this.initializeMemberHistory(payload).catch((error) => {
+                console.error('Failed to initialize member history:', error)
+                if (this._isBeingDestroyed || this._isDestroyed) return
+                this.loading = false
+                this.ready = true
+            })
+        },
+        async initializeMemberHistory({ senderId, roomId, senderName }) {
+            const requestId = ++this.historyRequestId
             this.senderId = senderId
             this.roomId = roomId
             this.senderName = senderName
             this.room.roomId = senderId
+            this.messages = []
+            this.messagesLoaded = false
+            this.ready = false
+
             if (roomId === 0) {
                 document.title = `${senderName} 在所有群的发言记录`
                 this.room.roomName = `${senderName} 在所有群的发言记录`
@@ -102,69 +150,128 @@ export default {
                         }
                     }
                 } catch (e) {}
+                if (requestId !== this.historyRequestId) return
                 const titleSuffix =
                     groupName && groupNumber ? `在 ${groupName}（${groupNumber}）` : groupName ? `在 ${groupName}` : ''
                 document.title = `${senderName} ${titleSuffix}的发言记录`
                 this.room.roomName = `${senderName} ${titleSuffix}的发言记录`
             }
             // 加载第一页消息
-            await this.fetchInitialMessages()
-        })
-    },
-    beforeDestroy() {
-        this.lifecycleScope?.dispose()
-    },
-    components: {
-        Room,
-    },
-    methods: {
-        async fetchInitialMessages() {
-            this.loading = true
-            let msgs
-            try {
-                msgs = await ipc.fetchMessagesBySender(this.roomId, this.senderId, 0)
-                console.log('Fetched initial messages:', msgs)
-                if (!msgs || msgs.length < 20) {
-                    this.messagesLoaded = true
+            await this.fetchInitialMessages(requestId)
+        },
+        getScrollContainer() {
+            return this.$refs.room?.$refs?.scrollContainer || null
+        },
+        isCurrentHistoryRequest(requestId) {
+            return requestId === this.historyRequestId && !this._isBeingDestroyed && !this._isDestroyed
+        },
+        scheduleScrollToBottom(requestId) {
+            this.$nextTick(() => {
+                if (!this.isCurrentHistoryRequest(requestId)) return
+                this.lifecycleScope.animationFrame(() => {
+                    if (!this.isCurrentHistoryRequest(requestId)) return
+                    const element = this.getScrollContainer()
+                    if (element) element.scrollTo({ top: element.scrollHeight })
+                })
+            })
+        },
+        captureScrollAnchor() {
+            const element = this.getScrollContainer()
+            if (!element) return null
+
+            const containerRect = element.getBoundingClientRect()
+            const messageElements = element.querySelectorAll('.vac-message-box[id]')
+            for (const messageElement of messageElements) {
+                const messageRect = messageElement.getBoundingClientRect()
+                if (messageRect.bottom > containerRect.top && messageRect.top < containerRect.bottom) {
+                    return {
+                        element,
+                        messageId: messageElement.id,
+                        top: messageRect.top,
+                        scrollTop: element.scrollTop,
+                        scrollHeight: element.scrollHeight,
+                    }
                 }
+            }
+
+            return {
+                element,
+                messageId: null,
+                top: 0,
+                scrollTop: element.scrollTop,
+                scrollHeight: element.scrollHeight,
+            }
+        },
+        restoreScrollAnchor(anchor, requestId, attempt = 0) {
+            if (!anchor) return
+            this.lifecycleScope.animationFrame(() => {
+                if (!this.isCurrentHistoryRequest(requestId)) return
+                const element = this.getScrollContainer()
+                if (!element) return
+
+                const messageElement = anchor.messageId ? document.getElementById(anchor.messageId) : null
+                if (messageElement) {
+                    element.scrollTop += messageElement.getBoundingClientRect().top - anchor.top
+                } else if (attempt === 0) {
+                    element.scrollTop = anchor.scrollTop + element.scrollHeight - anchor.scrollHeight
+                }
+
+                // 图片或富文本的尺寸可能在首帧后才稳定，再校正两帧避免滚动缓慢漂移。
+                if (attempt < 2) this.restoreScrollAnchor(anchor, requestId, attempt + 1)
+            })
+        },
+        async fetchInitialMessages(requestId = this.historyRequestId) {
+            this.loading = true
+            let msgs = []
+            try {
+                const result = await ipc.fetchMessagesBySender(this.roomId, this.senderId, 0)
+                msgs = Array.isArray(result) ? result : []
             } catch (e) {
                 console.error('Failed to fetch initial messages:', e)
-                this.messagesLoaded = true
             }
+
+            if (!this.isCurrentHistoryRequest(requestId)) return
+            this.messagesLoaded = msgs.length < MEMBER_HISTORY_PAGE_SIZE
             this.loading = false
             // 先显示 Room 组件（messages 为空），让 watcher 以空数组初始化
             this.ready = true
             // 等待 Room 组件挂载完成
             await this.$nextTick()
-            if (msgs && msgs.length) {
-                this.messages = this.processMessages(msgs)
-            }
+            if (!this.isCurrentHistoryRequest(requestId)) return
+            this.messages = this.processMessages(msgs)
             // 等消息渲染完成后滚动到底部
-            this.$nextTick(() => {
-                this.lifecycleScope.timeout(() => {
-                    if (this.$refs.room && this.$refs.room.$refs.scrollContainer) {
-                        const el = this.$refs.room.$refs.scrollContainer
-                        el.scrollTo({ top: el.scrollHeight })
-                    }
-                }, 100)
-            })
+            this.scheduleScrollToBottom(requestId)
         },
         async loadMoreMessages() {
             if (this.loading) return
             this.loading = true
+            const requestId = this.historyRequestId
             try {
-                const msgs = await ipc.fetchMessagesBySender(this.roomId, this.senderId, this.messages.length)
-                if (msgs && msgs.length) {
-                    this.messages = [...this.processMessages(msgs), ...this.messages]
+                const result = await ipc.fetchMessagesBySender(this.roomId, this.senderId, this.messages.length)
+                const msgs = Array.isArray(result) ? result : []
+                if (!this.isCurrentHistoryRequest(requestId)) return
+
+                const existingMessageIds = new Set(this.messages.map((message) => messageIdKey(message._id)))
+                const olderMessages = this.processMessages(msgs).filter((message) => {
+                    const key = messageIdKey(message._id)
+                    if (existingMessageIds.has(key)) return false
+                    existingMessageIds.add(key)
+                    return true
+                })
+
+                if (olderMessages.length) {
+                    const anchor = this.captureScrollAnchor()
+                    this.messages = [...olderMessages, ...this.messages]
+                    await this.$nextTick()
+                    this.restoreScrollAnchor(anchor, requestId)
                 }
-                if (!msgs || msgs.length < 20) {
-                    this.messagesLoaded = true
-                }
+                if (msgs.length < MEMBER_HISTORY_PAGE_SIZE || !olderMessages.length) this.messagesLoaded = true
             } catch (e) {
                 console.error('Failed to fetch more messages:', e)
-                this.messagesLoaded = true
+                if (this.isCurrentHistoryRequest(requestId)) this.messagesLoaded = true
+            } finally {
+                if (this.isCurrentHistoryRequest(requestId)) this.loading = false
             }
-            this.loading = false
         },
         processMessages(msgs) {
             // 所有群模式：修改头像和用户名以显示群信息
